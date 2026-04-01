@@ -99,6 +99,7 @@ typedef struct {
     uint8_t volML;          /* computed left volume */
     uint8_t pseudoEchoVolume;
     uint8_t pseudoEchoLength;
+    uint8_t extendedCommand;   /* last XCMD selector (0x1D/0x1F), dispatched by 0x1E */
     uint8_t priority;
     uint8_t currentProgram; /* last program_change index (0-127) */
     ToneData currentVoice;  /* current instrument */

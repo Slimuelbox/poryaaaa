@@ -604,6 +604,20 @@ void m4a_engine_cc(M4AEngine *engine, int trackIndex, uint8_t cc, uint8_t value)
     case 0x1A: /* LFO delay (LFODL) */
         track->lfoDelay = value;
         break;
+    case 0x1D: /* Extended command selector (XCMD part 1) */
+    case 0x1F:
+        track->extendedCommand = value;
+        break;
+    case 0x1E: /* Extended command value (XCMD part 2) */
+        switch (track->extendedCommand) {
+        case 0x08: /* xIECV - pseudo-echo volume */
+            track->pseudoEchoVolume = value;
+            break;
+        case 0x09: /* xIECL - pseudo-echo length */
+            track->pseudoEchoLength = value;
+            break;
+        }
+        break;
     case 0x7B: /* All Notes Off */
         m4a_engine_all_notes_off(engine, trackIndex);
         break;
