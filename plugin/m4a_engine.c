@@ -342,6 +342,9 @@ void m4a_engine_note_on(M4AEngine *engine, int trackIndex, uint8_t key, uint8_t 
     /* Calculate combined priority */
     uint8_t combinedPriority = track->priority;
 
+    /* Reset LFO delay countdown (ply_note resets lfoDelayC = lfoDelay on note trigger) */
+    track->lfoDelayC = track->lfoDelay;
+
     /* Calculate track volumes */
     m4a_track_vol_pit_set(track);
 
@@ -587,13 +590,19 @@ void m4a_engine_cc(M4AEngine *engine, int trackIndex, uint8_t cc, uint8_t value)
         track->modM = 0;
         break;
     case 0x16: /* Modulation type (MODT) */
-        // TODO: none of the pokemon emerald songs use MODT
+        if (track->modT != value) {
+            track->modT = value;
+            refresh_volumes(engine, track, trackIndex);
+            refresh_channel_pitches(engine, track, trackIndex);
+        }
         break;
     case 0x18: /* Micro tuning (TUNE) */
-        // TODO: none of the pokemon emerald songs use TUNE
+        track->tune = (int8_t)(value - 0x40);
+        m4a_track_vol_pit_set(track);
+        refresh_channel_pitches(engine, track, trackIndex);
         break;
     case 0x1A: /* LFO delay (LFODL) */
-        // TODO: none of the pokemon emerald songs use LFODL
+        track->lfoDelay = value;
         break;
     case 0x7B: /* All Notes Off */
         m4a_engine_all_notes_off(engine, trackIndex);
