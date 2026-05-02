@@ -15,32 +15,38 @@ void m4a_pcm_channel_start(M4APCMChannel *ch, WaveData *wav, uint8_t type)
 {
     ch->wav = wav;
     ch->type = type;
-    ch->currentPointer = wav->data;
-    ch->count = wav->size;
-    ch->fw = 0;
     ch->envelopeVolume = 0;
 
-    /* Check for loop - GBA checks wav->status bits 14-15 (0xC000) */
-    ch->isLoop = (wav->status & 0xC000) != 0;
-    if (ch->isLoop) {
-        ch->loopStart = wav->data + wav->loopStart;
-        ch->loopLen = wav->size - wav->loopStart;
-        if (ch->loopLen <= 0) {
-            ch->isLoop = false;
-            ch->loopLen = 0;
+    if (wav->size == 0) {
+        /* Synth voice: no sample data, phase accumulator drives the oscillator.
+         * Triangle (type 2) starts at quarter-cycle (0x40000000) to avoid pop. */
+        uint8_t synthType = ((uint8_t *)wav->data)[1];
+        ch->currentPointer = NULL;
+        ch->count = 0;  /* IIR state for saw wave */
+        ch->isLoop = false;
+        ch->loopLen = 0;
+        ch->loopStart = NULL;
+        ch->fw = (synthType == 2) ? 0x40000000 : 0;
+    } else {
+        ch->currentPointer = wav->data;
+        ch->count = wav->size;
+        ch->fw = 0;
+
+        ch->isLoop = (wav->status & 0xC000) != 0;
+        if (ch->isLoop) {
+            ch->loopStart = wav->data + wav->loopStart;
+            ch->loopLen = wav->size - wav->loopStart;
+            if (ch->loopLen <= 0) {
+                ch->isLoop = false;
+                ch->loopLen = 0;
+            }
         }
     }
 
-    /* Set status to attack and immediately process first envelope step.
-     * On the GBA, the channel starts with CHN_START flag and the mixer
-     * handles the transition. Since our tick runs at ~60Hz but render runs
-     * at the DAW sample rate, we need the envelope to be non-zero from
-     * the first render call to avoid silence at the start. */
     ch->status = CHN_ENV_ATTACK;
     if (ch->isLoop)
         ch->status |= CHN_LOOP;
 
-    /* Immediately process attack to get a non-zero envelope volume */
     uint8_t envVol = ch->attack;
     if (envVol >= 0xFF) {
         envVol = 0xFF;
@@ -152,6 +158,63 @@ void m4a_pcm_channel_render(M4APCMChannel *ch, int32_t *mixL, int32_t *mixR)
 {
     if (!(ch->status & CHN_ON) || (ch->status & CHN_START))
         return;
+
+    /* Synth voice: wav->size == 0 means software oscillator, not sample data.
+     * Params: data[1]=type, data[2]=baseDuty, data[3]=widthChange1,
+     *         data[4]=modAmount, data[5]=widthChange2.
+     * Phase accumulator uses the full 32-bit fw; advances by frequency<<3 per
+     * output sample (matches C_setup_synth's r4 = freq*VAR_DEF_PITCH_FAC,
+     * per-sample advance r4<<3). */
+    if (ch->wav->size == 0) {
+        const uint8_t *p = (const uint8_t *)ch->wav->data;
+        uint8_t synthType = p[1];
+        uint32_t phase    = ch->fw;
+        uint32_t step     = ch->frequency << 3;
+        int32_t  sample;
+
+        switch (synthType) {
+        case 0: {  /* Pulse wave (C_synth_pulse_loop) */
+            uint32_t r2   = (uint32_t)p[3] << 24;           /* widthChange1 << 24 */
+            uint32_t r6   = r2 + ((uint32_t)p[5] << 24);   /* + widthChange2 << 24 */
+            if ((int32_t)r6 < 0) r6 = ~r6;                 /* mvnmi */
+            uint32_t duty = (r6 >> 8) * (uint32_t)p[4] + ((uint32_t)p[2] << 24);
+            sample = (phase < duty) ? 64 : -64;
+            phase += step;
+            break;
+        }
+        case 1: {  /* Saw wave (C_synth_saw_loop) — leaky integrator approximation.
+                    * ch->count holds the IIR state (r2 in assembly). Volume is
+                    * halved in the GBA (r11 lsr#1), reproduced here via >>9. */
+            phase += step;
+            int32_t r9    = (int32_t)(phase >> 24) - 0x70 - (int32_t)(phase >> 26);
+            int32_t state = (int32_t)ch->count;
+            state = r9 + (state >> 1);
+            ch->count = state;
+            sample = state;
+            *mixR += (sample * ch->envelopeVolumeRight) >> 9;
+            *mixL += (sample * ch->envelopeVolumeLeft)  >> 9;
+            ch->fw = phase;
+            return;
+        }
+        case 2: {  /* Triangle wave (C_synth_triangle_loop) */
+            phase += step;
+            if ((phase & 0x80000000) == 0)
+                sample = (int32_t)(phase >> 23) - 128;      /* ascending: -128..127 */
+            else
+                sample = 384 - (int32_t)(phase >> 23);      /* descending: 128..-127 */
+            break;
+        }
+        default:
+            sample = 0;
+            phase += step;
+            break;
+        }
+
+        ch->fw = phase;
+        *mixR += (sample * ch->envelopeVolumeRight) >> 8;
+        *mixL += (sample * ch->envelopeVolumeLeft)  >> 8;
+        return;
+    }
 
     int8_t *ptr = ch->currentPointer;
     uint32_t fw = ch->fw;
