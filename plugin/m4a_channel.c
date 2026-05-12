@@ -22,7 +22,7 @@ void m4a_pcm_channel_start(M4APCMChannel *ch, WaveData *wav, uint8_t type)
          * Triangle (type 2) starts at quarter-cycle (0x40000000) to avoid pop. */
         uint8_t synthType = ((uint8_t *)wav->data)[1];
         ch->currentPointer = NULL;
-        ch->count = 0;  /* IIR state for saw wave */
+        ch->count = 0;  /* saw: IIR state; pulse: PWM pos accumulator */
         ch->isLoop = false;
         ch->loopLen = 0;
         ch->loopStart = NULL;
@@ -173,20 +173,27 @@ void m4a_pcm_channel_render(M4APCMChannel *ch, int32_t *mixL, int32_t *mixR)
         int32_t  sample;
 
         switch (synthType) {
-        case 0: {  /* Pulse wave (C_synth_pulse_loop) */
-            uint32_t r2   = (uint32_t)p[3] << 24;           /* widthChange1 << 24 */
-            uint32_t r6   = r2 + ((uint32_t)p[5] << 24);   /* + widthChange2 << 24 */
-            if ((int32_t)r6 < 0) r6 = ~r6;                 /* mvnmi */
-            uint32_t duty = (r6 >> 8) * (uint32_t)p[4] + ((uint32_t)p[2] << 24);
-            sample = (phase < duty) ? 64 : -64;
+        case 0: {  /* Pulse wave (C_synth_pulse_loop) — modulated duty cycle.
+                    * ch->count holds the PWM pos accumulator (advanced each VBlank tick).
+                    * calcThresh maps pos to a 32-bit duty threshold (matches agbplay). */
+            uint32_t pos = (uint32_t)ch->count;
+            uint32_t iThreshold = ((uint32_t)p[5] << 24) + pos;
+            if ((int32_t)iThreshold < 0)
+                iThreshold = ~iThreshold >> 8;
+            else
+                iThreshold = iThreshold >> 8;
+            iThreshold = iThreshold * (uint32_t)p[4] + ((uint32_t)p[2] << 24);
+            sample = (phase < iThreshold) ? 64 : -64;
             phase += step;
             break;
         }
         case 1: {  /* Saw wave (C_synth_saw_loop) — leaky integrator approximation.
                     * ch->count holds the IIR state (r2 in assembly). Volume is
-                    * halved in the GBA (r11 lsr#1), reproduced here via >>9. */
+                    * halved in the GBA (r11 lsr#1), reproduced here via >>9.
+                    * GBA: mov r6, r7, lsl#1; sub r9, r9, r6, lsr#27
+                    * (phase<<1 in 32-bit differs from phase>>26 when phase>=0x80000000) */
             phase += step;
-            int32_t r9    = (int32_t)(phase >> 24) - 0x70 - (int32_t)(phase >> 26);
+            int32_t r9    = (int32_t)(phase >> 24) - 0x70 - (int32_t)((phase << 1) >> 27);
             int32_t state = (int32_t)ch->count;
             state = r9 + (state >> 1);
             ch->count = state;

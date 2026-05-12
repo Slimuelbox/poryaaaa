@@ -12,8 +12,10 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
 
 # Prevent host pkg-config from leaking Linux libraries (e.g. JACK) into
 # Windows cross-builds.
-set(PKG_CONFIG_EXECUTABLE "")
-set(ENV{PKG_CONFIG} "")
+if(WIN32)
+    set(PKG_CONFIG_EXECUTABLE "")
+    set(ENV{PKG_CONFIG} "")
+endif()
 
 # Statically link the C/C++/pthread runtimes so the resulting binaries
 # don't need libwinpthread-1.dll or other MinGW DLLs at runtime.

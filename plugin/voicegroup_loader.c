@@ -1095,7 +1095,16 @@ static WaveData *load_wave_data(const char *projectRoot, const char *relativePat
     uint32_t loopStart = header[8] | (header[9] << 8) | (header[10] << 16) | (header[11] << 24);
     uint32_t size = header[12] | (header[13] << 8) | (header[14] << 16) | (header[15] << 24);
 
-    WaveData *wd = malloc(sizeof(WaveData) + size + 1);
+    /* Synth voices (size == 0) have param bytes immediately after the 16-byte header
+     * (pad, type, baseDuty, dutyStep, depth, initDuty).  Read them now before the
+     * allocation so we know how many bytes to reserve. */
+    uint8_t synthParams[8] = {0};
+    uint32_t synthParamCount = 0;
+    if (size == 0)
+        synthParamCount = (uint32_t)fread(synthParams, 1, 8, f);
+
+    uint32_t allocCount = (size == 0) ? synthParamCount : size;
+    WaveData *wd = malloc(sizeof(WaveData) + allocCount + 1);
     if (!wd) {
         fclose(f);
         return NULL;
@@ -1110,11 +1119,15 @@ static WaveData *load_wave_data(const char *projectRoot, const char *relativePat
     wd->size = size;
     wd->data = (int8_t *)((uint8_t *)wd + sizeof(WaveData));
 
-    size_t bytesRead = fread(wd->data, 1, size, f);
-    if (bytesRead < size) {
-        memset(wd->data + bytesRead, 0, size - bytesRead);
+    if (size == 0) {
+        memcpy(wd->data, synthParams, synthParamCount);
+        wd->data[synthParamCount] = 0;
+    } else {
+        size_t bytesRead = fread(wd->data, 1, size, f);
+        if (bytesRead < size)
+            memset(wd->data + bytesRead, 0, size - bytesRead);
+        wd->data[size] = wd->data[size - 1];
     }
-    wd->data[size] = wd->data[size > 0 ? size - 1 : 0];
 
     fclose(f);
     return wd;

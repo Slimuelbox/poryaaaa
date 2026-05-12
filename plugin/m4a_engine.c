@@ -780,6 +780,13 @@ void m4a_engine_tick(M4AEngine *engine)
                     ch->status |= CHN_STOP;
             }
             m4a_pcm_channel_tick(ch, engine->masterVolume);
+
+            /* Advance PWM pos accumulator for synth pulse channels (once per VBlank) */
+            if (ch->wav && ch->wav->size == 0) {
+                const uint8_t *p = (const uint8_t *)ch->wav->data;
+                if (p[1] == 0)  /* SYNTH_PWM */
+                    ch->count = (int32_t)((uint32_t)ch->count + ((uint32_t)p[3] << 24));
+            }
         }
     }
 
