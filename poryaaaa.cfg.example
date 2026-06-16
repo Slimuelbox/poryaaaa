@@ -32,6 +32,21 @@ song_master_volume=127
 # Default: 5 (matches Pokemon Emerald's engine configuration).
 #max_channels=5
 
+# ---- Opt-in effect features ----
+# These extend the stock m4a engine and are off by default. They can also be
+# toggled at runtime from the GUI's "Options" menu and are saved per project.
+# Set to 1 to enable, 0 to disable.
+
+# Respect base MIDI key for PCM (DirectSound) voices: treat the voice's key
+# field as the sample's base note so pressed notes play at the intended pitch.
+#respect_base_midi_key=0
+
+# Portamento glide effect (CC 5 = glide duration in song ticks).
+#portamento=0
+
+# Pulse-width modulation on CGB square channels (CC 0x17 = pattern, CC 0x19 = speed).
+#pwm=0
+
 # Additional .inc files for sample symbol definitions (semicolon-separated, relative to project_root).
 # Normally auto-discovered from sound/direct_sound_data.inc.
 #sound_data_paths=

@@ -345,6 +345,44 @@ static void render_voices_tab(M4AGuiState *gui)
     }
 }
 
+/* A toggleable menu item with a checkmark and a hover tooltip.  Flips *value
+ * and flags the settings dirty when clicked.  The tooltip shows on hover even
+ * while the menu popup is open (ImGui shows item tooltips inside menus). */
+static void toggle_menu_item(M4AGuiState *gui, const char *label,
+                             bool *value, const char *help)
+{
+    if (ImGui::MenuItem(label, nullptr, *value)) {
+        *value = !*value;
+        gui->settingsChanged = true;
+    }
+    if (help && help[0])
+        ImGui::SetItemTooltip("%s", help);
+}
+
+/* Top menu bar.  "Options" holds the opt-in effect features as toggleable
+ * (checkmarked) items, each with hover help describing what it does. */
+static void render_menu_bar(M4AGuiState *gui)
+{
+    if (!ImGui::BeginMenuBar())
+        return;
+
+    if (ImGui::BeginMenu("Options")) {
+        toggle_menu_item(gui, "Respect Base MIDI Key", &gui->settings.respectBaseMidiKey,
+            "For PCM (DirectSound) instruments, treat the voice's key field as the\n"
+            "sample's base MIDI note and transpose accordingly, so a pressed note\n"
+            "plays at its intended pitch. Off matches stock pokeemerald behavior.");
+        toggle_menu_item(gui, "Portamento", &gui->settings.portamentoEnabled,
+            "Enable the portamento glide effect (CC 5 = glide time in ticks).\n"
+            "Notes slide smoothly from the previous note's pitch to the new one.");
+        toggle_menu_item(gui, "Pulse-Width Modulation", &gui->settings.pwmEnabled,
+            "Enable pulse-width modulation on the CGB square channels\n"
+            "(CC 0x17 = duty-cycle pattern, CC 0x19 = modulation speed).");
+        ImGui::EndMenu();
+    }
+
+    ImGui::EndMenuBar();
+}
+
 /* Render a single ImGui frame — called from PUGL_EXPOSE. */
 static void render_frame(M4AGuiState *gui)
 {
@@ -365,9 +403,12 @@ static void render_frame(M4AGuiState *gui)
         ImGuiWindowFlags_NoResize        |
         ImGuiWindowFlags_NoMove          |
         ImGuiWindowFlags_NoCollapse      |
+        ImGuiWindowFlags_MenuBar         |
         ImGuiWindowFlags_NoBringToFrontOnFocus;
 
     ImGui::Begin("##Main", nullptr, wflags);
+
+    render_menu_bar(gui);
 
     /* ---- Plugin title ---- */
     ImGui::TextColored(ImVec4(0.3f, 0.75f, 1.0f, 1.0f), "poryaaaa");

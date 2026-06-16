@@ -120,6 +120,12 @@ static void load_config_file(M4APluginData *data)
             data->songMasterVolume = (uint8_t)v;
         } else if (strcmp(key, "analog_filter") == 0) {
             data->analogFilter = (atoi(value) != 0);
+        } else if (strcmp(key, "respect_base_midi_key") == 0) {
+            data->respectBaseMidiKey = (atoi(value) != 0);
+        } else if (strcmp(key, "portamento") == 0) {
+            data->portamentoEnabled = (atoi(value) != 0);
+        } else if (strcmp(key, "pwm") == 0) {
+            data->pwmEnabled = (atoi(value) != 0);
         } else if (strcmp(key, "max_channels") == 0) {
             int v = atoi(value);
             if (v < 1) v = 1;
@@ -178,6 +184,10 @@ static bool plugin_init(const clap_plugin_t *plugin)
     data->reverbAmount = 0;
     data->analogFilter = false;
     data->maxPcmChannels = 5;
+    data->respectBaseMidiKey = false;
+    data->portamentoEnabled = false;
+    data->pwmEnabled = false;
+    data->transportWasPlaying = false;
     data->projectRoot[0] = '\0';
     data->voicegroupName[0] = '\0';
     data->loadedVg = NULL;
@@ -213,6 +223,9 @@ static bool plugin_activate(const clap_plugin_t *plugin, double sample_rate,
     data->engine.songMasterVolume = data->songMasterVolume;
     data->engine.analogFilter = data->analogFilter;
     data->engine.maxPcmChannels = data->maxPcmChannels;
+    data->engine.respectBaseMidiKey = data->respectBaseMidiKey;
+    m4a_engine_set_portamento_enabled(&data->engine, data->portamentoEnabled);
+    m4a_engine_set_pwm_enabled(&data->engine, data->pwmEnabled);
     m4a_reverb_set_amount(&data->engine.reverb, data->reverbAmount);
 
     /* If voicegroup is configured, load it */
@@ -251,6 +264,9 @@ static bool plugin_activate(const clap_plugin_t *plugin, double sample_rate,
         gs.songMasterVolume  = data->songMasterVolume;
         gs.analogFilter      = data->analogFilter;
         gs.maxPcmChannels    = data->maxPcmChannels;
+        gs.respectBaseMidiKey = data->respectBaseMidiKey;
+        gs.portamentoEnabled = data->portamentoEnabled;
+        gs.pwmEnabled        = data->pwmEnabled;
         gs.voicegroupLoaded  = (data->loadedVg != NULL);
         m4a_gui_update_settings(data->gui, &gs);
     }
@@ -354,6 +370,17 @@ static clap_process_status plugin_process(const clap_plugin_t *plugin,
     if (process->transport
         && (process->transport->flags & CLAP_TRANSPORT_HAS_TEMPO)) {
         m4a_engine_set_tempo_bpm(&data->engine, process->transport->tempo);
+    }
+
+    /* When the host transport stops, forget portamento note history so the
+     * first note after the playhead moves doesn't glide from a note that was
+     * sounding when playback paused.  (Hosts that send All Notes Off / All
+     * Sound Off on stop are covered by those handlers too.) */
+    if (process->transport) {
+        bool playing = (process->transport->flags & CLAP_TRANSPORT_IS_PLAYING) != 0;
+        if (data->transportWasPlaying && !playing)
+            m4a_engine_reset_portamento(&data->engine);
+        data->transportWasPlaying = playing;
     }
 
     const uint32_t numFrames = process->frames_count;
@@ -479,6 +506,13 @@ static bool state_save(const clap_plugin_t *plugin, const clap_ostream_t *stream
     uint8_t analogFilterByte = data->analogFilter ? 1 : 0;
     if (stream->write(stream, &analogFilterByte, 1) != 1) return false;
     if (stream->write(stream, &data->maxPcmChannels, 1) != 1) return false;
+    /* Opt-in feature flags (appended after maxPcmChannels for back-compat) */
+    uint8_t baseKeyByte    = data->respectBaseMidiKey ? 1 : 0;
+    uint8_t portamentoByte = data->portamentoEnabled  ? 1 : 0;
+    uint8_t pwmByte        = data->pwmEnabled         ? 1 : 0;
+    if (stream->write(stream, &baseKeyByte, 1) != 1) return false;
+    if (stream->write(stream, &portamentoByte, 1) != 1) return false;
+    if (stream->write(stream, &pwmByte, 1) != 1) return false;
 
     return true;
 }
@@ -518,6 +552,14 @@ static bool state_load(const clap_plugin_t *plugin, const clap_istream_t *stream
     if (maxChannelsByte < 1) maxChannelsByte = 1;
     if (maxChannelsByte > MAX_PCM_CHANNELS) maxChannelsByte = MAX_PCM_CHANNELS;
     data->maxPcmChannels = maxChannelsByte;
+    /* Opt-in feature flags are optional (absent in older saves); default off. */
+    uint8_t baseKeyByte = 0, portamentoByte = 0, pwmByte = 0;
+    stream->read(stream, &baseKeyByte, 1);
+    stream->read(stream, &portamentoByte, 1);
+    stream->read(stream, &pwmByte, 1);
+    data->respectBaseMidiKey = (baseKeyByte != 0);
+    data->portamentoEnabled  = (portamentoByte != 0);
+    data->pwmEnabled         = (pwmByte != 0);
 
     if (data->activated) {
         /* Only reload voicegroup if the project root or name actually changed */
@@ -540,6 +582,9 @@ static bool state_load(const clap_plugin_t *plugin, const clap_istream_t *stream
         data->engine.songMasterVolume = data->songMasterVolume;
         data->engine.analogFilter = data->analogFilter;
         data->engine.maxPcmChannels = data->maxPcmChannels;
+        data->engine.respectBaseMidiKey = data->respectBaseMidiKey;
+        m4a_engine_set_portamento_enabled(&data->engine, data->portamentoEnabled);
+        m4a_engine_set_pwm_enabled(&data->engine, data->pwmEnabled);
         m4a_reverb_set_amount(&data->engine.reverb, data->reverbAmount);
     }
 
@@ -549,6 +594,9 @@ static bool state_load(const clap_plugin_t *plugin, const clap_istream_t *stream
         memset(&gs, 0, sizeof(gs));
         snprintf(gs.projectRoot,    sizeof(gs.projectRoot),    "%s", data->projectRoot);
         snprintf(gs.voicegroupName, sizeof(gs.voicegroupName), "%s", data->voicegroupName);
+        gs.respectBaseMidiKey = data->respectBaseMidiKey;
+        gs.portamentoEnabled  = data->portamentoEnabled;
+        gs.pwmEnabled         = data->pwmEnabled;
         gs.reverbAmount     = data->reverbAmount;
         gs.masterVolume     = data->masterVolume;
         gs.songMasterVolume = data->songMasterVolume;
@@ -630,6 +678,9 @@ static void timer_on_timer(const clap_plugin_t *plugin, clap_id timer_id)
     data->songMasterVolume = gs.songMasterVolume;
     data->analogFilter     = gs.analogFilter;
     data->maxPcmChannels   = gs.maxPcmChannels;
+    data->respectBaseMidiKey = gs.respectBaseMidiKey;
+    data->portamentoEnabled  = gs.portamentoEnabled;
+    data->pwmEnabled         = gs.pwmEnabled;
 
     if (data->activated) {
         data->engine.masterVolume = gs.masterVolume;
@@ -637,6 +688,9 @@ static void timer_on_timer(const clap_plugin_t *plugin, clap_id timer_id)
         m4a_reverb_set_amount(&data->engine.reverb, gs.reverbAmount);
         data->engine.analogFilter = gs.analogFilter;
         data->engine.maxPcmChannels = gs.maxPcmChannels;
+        data->engine.respectBaseMidiKey = gs.respectBaseMidiKey;
+        m4a_engine_set_portamento_enabled(&data->engine, gs.portamentoEnabled);
+        m4a_engine_set_pwm_enabled(&data->engine, gs.pwmEnabled);
     }
 
     if (reloadVoicegroup) {
@@ -738,6 +792,9 @@ static bool gui_create(const clap_plugin_t *plugin, const char *api, bool is_flo
     gs.songMasterVolume = data->songMasterVolume;
     gs.analogFilter     = data->analogFilter;
     gs.maxPcmChannels   = data->maxPcmChannels;
+    gs.respectBaseMidiKey = data->respectBaseMidiKey;
+    gs.portamentoEnabled  = data->portamentoEnabled;
+    gs.pwmEnabled         = data->pwmEnabled;
     gs.voicegroupLoaded = (data->loadedVg != NULL);
 
     data->gui = m4a_gui_create(data->host, &gs, s_pluginLogPath);

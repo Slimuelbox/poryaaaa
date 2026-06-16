@@ -17,7 +17,12 @@ typedef struct {
     uint8_t songMasterVolume; // The song-level master volume (0-127)
     bool analogFilter;
     uint8_t maxPcmChannels;
+    /* Opt-in effect features (persisted; default off) */
+    bool respectBaseMidiKey;
+    bool portamentoEnabled;
+    bool pwmEnabled;
     bool activated;
+    bool transportWasPlaying; /* last seen CLAP_TRANSPORT_IS_PLAYING state */
 
     /* Voice editor: snapshot of original voices and per-voice override flags */
     ToneData originalVoices[VOICEGROUP_SIZE];

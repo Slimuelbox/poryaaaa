@@ -23,6 +23,10 @@ typedef struct {
     uint8_t songMasterVolume;
     bool analogFilter;
     uint8_t maxPcmChannels;
+    /* Opt-in effect feature toggles (Options menu) */
+    bool respectBaseMidiKey;
+    bool portamentoEnabled;
+    bool pwmEnabled;
     bool voicegroupLoaded;
 } M4AGuiSettings;
 

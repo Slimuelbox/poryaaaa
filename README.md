@@ -38,6 +38,11 @@ Audio options:
   --sample-rate <hz>          Sample rate in Hz (default: 44100)
   --tail <seconds>            Silence after last event, no loop markers (default: 3.0)
 
+Opt-in effect features (off by default; extend the stock m4a engine):
+  --respect-base-midi-key     Treat a PCM voice's key as the sample's base MIDI note
+  --portamento                Enable the portamento glide effect (CC 5)
+  --pwm                       Enable pulse-width modulation on CGB square channels (CC 0x17/0x19)
+
 Loop options (when MIDI contains '[' / ']' text events):
   --loop-count <n>            Number of loop body repetitions (default: 2)
   --fadeout <seconds>         Fadeout duration after final loop (default: 5.0)
@@ -148,6 +153,9 @@ The plugin reads `poryaaaa.cfg` on startup for initial defaults. All settings ca
 | `reverb` | `0` | Reverb amount (0–127) |
 | `master_volume` | `15` | M4A master volume (0–15) |
 | `song_master_volume` | `127` | Song-level volume multiplier (0–127) |
+| `respect_base_midi_key` | `0` | Opt-in: treat a PCM voice's key as the sample's base MIDI note so pressed notes play at the intended pitch |
+| `portamento` | `0` | Opt-in: enable the portamento glide effect (CC 5 = glide time in ticks) |
+| `pwm` | `0` | Opt-in: enable pulse-width modulation on CGB square channels (CC 0x17 / 0x19) |
 | `sound_data_paths` | *(auto)* | Extra `.inc` files for sample symbols (semicolon-separated, relative to project root) |
 | `voicegroup_paths` | *(auto)* | Extra voicegroup search directories or files |
 | `sample_dirs` | *(auto)* | Extra `.wav` sample search directories |
@@ -155,10 +163,11 @@ The plugin reads `poryaaaa.cfg` on startup for initial defaults. All settings ca
 
 #### GUI
 
-The plugin opens a settings panel built with [Dear ImGui](https://github.com/ocornut/imgui) and [GLFW](https://www.glfw.org/):
+The plugin opens a settings panel built with [Dear ImGui](https://github.com/ocornut/imgui) and [Pugl](https://github.com/lv2/pugl) (a lightweight embeddable windowing library):
 
-- **Project Root** / **Voicegroup**: edit and press **Reload** to apply
-- **Song Volume** (0–127), **Reverb** (0–127): take effect immediately
+- **General** tab — **Project Root** / **Voicegroup**: edit and press **Reload** to apply; **Song Volume** (0–127), **Reverb** (0–127), **Polyphony**, and **GBA Analog Filter** take effect immediately
+- **Voices** tab — inspect and edit individual voices in the loaded voicegroup
+- **Options** menu — toggle the opt-in effect features (Respect Base MIDI Key, Portamento, Pulse-Width Modulation); hover an item for help text. Toggles take effect immediately and are saved per project.
 
 On Windows the GUI is embedded inside the DAW's FX window. On Linux/macOS it opens as a floating window.
 
@@ -217,7 +226,8 @@ cmd/
 
 plugin/
   m4a_plugin.c/.h             CLAP entry point, MIDI event handling, extension dispatch
-  m4a_gui.cpp/.h              Dear ImGui + GLFW settings GUI (C++ with C interface)
+  m4a_gui.cpp/.h              Dear ImGui + Pugl settings GUI (C++ with C interface)
+  imgui_impl_pugl.cpp/.h      Custom ImGui Pugl windowing backend
   m4a_engine.c/.h             Core engine: tick processing, channel allocation, MIDI routing
   m4a_channel.c/.h            PCM and CGB channel rendering, ADSR envelopes
   m4a_tables.c/.h             Frequency/scale tables (from m4a_tables.c)
@@ -231,10 +241,10 @@ test/
 
 third_party/
   miniaudio.h            Single-header audio I/O library (used by poryaaaa_render)
+  pugl/                  Vendored Pugl windowing library (GUI backend)
 
 clap-sdk/                CLAP plugin SDK (submodule)
 clap-wrapper/            Wraps the CLAP plugin as a standalone app (submodule)
-glfw/                    GLFW 3.4 (submodule)
 imgui/                   Dear ImGui (submodule)
 ```
 

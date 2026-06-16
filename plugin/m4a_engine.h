@@ -72,6 +72,21 @@ typedef struct {
     uint8_t release;
 } ToneData;
 
+/* Pulse-width modulation duty-cycle pattern (matches GBA PulseWidthModPattern).
+ * The PWMC command selects a pattern by index and the PWMS command sets the
+ * modulation speed; the effect cycles a CGB square channel's duty cycle through
+ * the pattern's steps.  Hardware duty values: 0=12.5%, 1=25%, 2=50%, 3=75%.
+ * Only used when the opt-in pulse-width modulation feature is enabled. */
+#define MAX_PWM_PATTERN_STEPS 7
+
+typedef struct {
+    uint8_t numSteps;                    /* 0 = disabled */
+    uint8_t duty[MAX_PWM_PATTERN_STEPS]; /* duty cycle per step (0-3) */
+} PulseWidthModPattern;
+
+extern const PulseWidthModPattern gPulseWidthModPatterns[];
+extern const uint8_t gNumPulseWidthModPatterns;
+
 /* Track state (per MIDI channel) */
 typedef struct {
     uint8_t flags;
@@ -99,6 +114,18 @@ typedef struct {
     uint8_t volML;          /* computed left volume */
     uint8_t pseudoEchoVolume;
     uint8_t pseudoEchoLength;
+    uint8_t portamentoDuration;  /* PORTAMENTO (CC 5) glide duration in song ticks; 0 = off */
+    uint8_t portamentoPrevKey;   /* channel key of the last note played (glide start key);
+                                  * 0 = no note played yet.  Updated on every note trigger
+                                  * so glides never depend on whether the previous note's
+                                  * channel is still alive. */
+    uint8_t portamentoTargetKey; /* glide destination key (newest note's channel key) */
+    bool portamentoGliding;      /* a glide is in progress */
+    uint32_t portamentoElapsed;  /* accumulated tempoI units; glide done at duration*150 */
+    uint8_t pwmPattern;          /* PWMC (CC 0x17): duty-cycle pattern index; 0 = off */
+    uint8_t pwmSpeed;            /* PWMS (CC 0x19): VBlank frames per step; 0 = off */
+    uint8_t pwmSpeedCounter;     /* counts down from pwmSpeed to the next step */
+    uint8_t pwmStep;             /* current index into the pattern's duty[] */
     uint8_t priority;
     uint8_t currentProgram; /* last program_change index (0-127) */
     ToneData currentVoice;  /* current instrument */
@@ -204,6 +231,16 @@ struct M4AEngine {
     uint8_t maxPcmChannels; /* active PCM channel count */
     uint8_t c15;            /* counter 0-14 for CGB envelope double-step */
 
+    /* Opt-in effect features (off by default; toggled from the GUI/config).
+     * These extend the base m4a behavior and are not enabled in the stock
+     * pokeemerald/pokefirered engine, so they are gated behind flags. */
+    bool respectBaseMidiKey; /* PCM voices: treat voice->key as the sample's base
+                              * MIDI note and transpose so the pressed key plays
+                              * at the intended pitch (eventide-style behavior). */
+    bool portamentoEnabled;  /* honor PORTAMENTO (CC 5) glides between notes */
+    bool pwmEnabled;         /* honor pulse-width modulation (CC 0x17/0x19) */
+    bool pwmActiveFlag;      /* true while any track has pulse-width modulation running */
+
     /* GBA analog output emulation: IIR low-pass filter */
     bool analogFilter;      /* enable/disable the hardware output filter */
     float lowPassLeft;
@@ -243,6 +280,19 @@ void m4a_engine_cc(M4AEngine *engine, int trackIndex, uint8_t cc, uint8_t value)
 void m4a_engine_pitch_bend(M4AEngine *engine, int trackIndex, int16_t bend);
 void m4a_engine_all_notes_off(M4AEngine *engine, int trackIndex);
 void m4a_engine_all_sound_off(M4AEngine *engine);
+
+/* Forget every track's portamento note history (the "previous note" a glide
+ * would start from).  Called automatically by all_notes_off/all_sound_off;
+ * also call on DAW transport stop so the first note after the playhead moves
+ * doesn't glide from a note that was sounding before playback paused. */
+void m4a_engine_reset_portamento(M4AEngine *engine);
+
+/* Toggle the opt-in effect features at runtime.  Disabling portamento or
+ * pulse-width modulation also clears any in-progress effect state (active
+ * glides, modulated duty cycles) so toggling mid-playback is glitch-free. */
+void m4a_engine_set_portamento_enabled(M4AEngine *engine, bool enabled);
+void m4a_engine_set_pwm_enabled(M4AEngine *engine, bool enabled);
+
 void m4a_engine_set_song_volume(M4AEngine *engine, uint8_t volume);
 
 /* Set tempo from DAW BPM.  The GBA relationship is tempoI ≈ BPM
