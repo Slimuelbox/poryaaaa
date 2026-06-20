@@ -211,6 +211,12 @@ void m4a_cgb_channel_start(M4ACGBChannel *ch)
     ch->status = CHN_ENV_ATTACK;
     ch->modify = 0x03; /* pitch + vol */
     ch->phase = 0;
+
+    /* Invalidate the cached phase increment / wave DC sum so the first
+     * rendered sample of this note recomputes them from the current
+     * frequency and wave table. */
+    ch->phaseIncFreq = 0xFFFFFFFFu;
+    ch->waveSumPointer = NULL;
     ch->envelopeCounter = ch->attack;
     if (ch->attack == 0) {
         /* Skip attack if instantaneous */
@@ -472,12 +478,17 @@ void m4a_cgb_channel_render(M4ACGBChannel *ch, int32_t *mixL, int32_t *mixR,
          * CGB frequency register value is used to compute the actual frequency.
          * The CGB freq register value = 2048 - (131072 / freq_hz).
          * So freq_hz = 131072 / (2048 - reg_value).
-         * We convert to a phase increment for our 32-bit accumulator. */
-        int32_t freqReg = ch->frequency;
-        if (freqReg >= 2048) freqReg = 2047;
-        float freqHz = 131072.0f / (float)(2048 - freqReg);
-        uint32_t phaseInc = (uint32_t)(freqHz / sampleRate * 4294967296.0f);
-        ch->phase += phaseInc;
+         * We convert to a phase increment for our 32-bit accumulator.  The
+         * increment is constant between (tick-rate) frequency changes, so it is
+         * cached and only recomputed when ch->frequency changes. */
+        if (ch->frequency != ch->phaseIncFreq) {
+            int32_t freqReg = ch->frequency;
+            if (freqReg >= 2048) freqReg = 2047;
+            float freqHz = 131072.0f / (float)(2048 - freqReg);
+            ch->phaseInc = (uint32_t)(freqHz / sampleRate * 4294967296.0f);
+            ch->phaseIncFreq = ch->frequency;
+        }
+        ch->phase += ch->phaseInc;
     } else if (cgbType == 3) {
         /* Programmable wave channel */
         if (ch->wavePointer) {
@@ -489,14 +500,21 @@ void m4a_cgb_channel_render(M4ACGBChannel *ch, int32_t *mixL, int32_t *mixR,
                 nibble = waveData[pos >> 1] & 0x0F;
             else
                 nibble = (waveData[pos >> 1] >> 4) & 0x0F;
-            /* Compute the sum of all 32 raw nibbles for DC offset removal.
-             * The wave mean varies per waveform, so using a fixed midpoint
-             * of 8 leaves a DC offset that causes clicks at note start/end. */
-            int32_t waveSum = 0;
-            for (int i = 0; i < 16; i++) {
-                waveSum += (waveData[i] >> 4) & 0x0F;
-                waveSum += waveData[i] & 0x0F;
+            /* Sum of all 32 raw nibbles for DC offset removal.  The wave mean
+             * varies per waveform, so using a fixed midpoint of 8 leaves a DC
+             * offset that causes clicks at note start/end.  The sum depends
+             * only on the wave table contents, so it is cached and recomputed
+             * only when wavePointer changes. */
+            if (ch->wavePointer != ch->waveSumPointer) {
+                int32_t waveSum = 0;
+                for (int i = 0; i < 16; i++) {
+                    waveSum += (waveData[i] >> 4) & 0x0F;
+                    waveSum += waveData[i] & 0x0F;
+                }
+                ch->waveSum = waveSum;
+                ch->waveSumPointer = ch->wavePointer;
             }
+            int32_t waveSum = ch->waveSum;
 
             /* Volume control: apply shift to raw 4-bit nibble to match
              * GBA hardware quantization (NR32 register).
@@ -521,14 +539,17 @@ void m4a_cgb_channel_render(M4ACGBChannel *ch, int32_t *mixL, int32_t *mixR,
             /* Center around the waveform's actual mean to remove DC offset */
             sample = (shifted - meanShifted) * 8;
 
-            /* Advance phase */
-            int32_t freqReg = ch->frequency;
-            if (freqReg >= 2048) freqReg = 2047;
-            float freqHz = 2097152.0f / (float)(2048 - freqReg);
-            /* Wave channel plays 32 samples per period */
-            freqHz /= 32.0f;
-            uint32_t phaseInc = (uint32_t)(freqHz / sampleRate * 4294967296.0f);
-            ch->phase += phaseInc;
+            /* Advance phase (cached; recomputed only on frequency change). */
+            if (ch->frequency != ch->phaseIncFreq) {
+                int32_t freqReg = ch->frequency;
+                if (freqReg >= 2048) freqReg = 2047;
+                float freqHz = 2097152.0f / (float)(2048 - freqReg);
+                /* Wave channel plays 32 samples per period */
+                freqHz /= 32.0f;
+                ch->phaseInc = (uint32_t)(freqHz / sampleRate * 4294967296.0f);
+                ch->phaseIncFreq = ch->frequency;
+            }
+            ch->phase += ch->phaseInc;
         }
     } else if (cgbType == 4) {
         /* Noise channel using LFSR */
@@ -536,17 +557,22 @@ void m4a_cgb_channel_render(M4ACGBChannel *ch, int32_t *mixL, int32_t *mixR,
 
         /* Advance LFSR at noise frequency rate */
         uint8_t noiseParams = ch->frequency & 0xFF;
-        uint8_t divRatio = noiseParams & 0x07;
-        uint8_t shiftFreq = (noiseParams >> 4) & 0x0F;
-        /* bool shortMode = (noiseParams >> 3) & 1; */
 
-        float baseFreq = 524288.0f;
-        float divisor = (divRatio == 0) ? 0.5f : (float)divRatio;
-        float noiseFreq = baseFreq / divisor / (float)(1 << (shiftFreq + 1));
+        /* Phase increment is constant between frequency changes; cache it. */
+        if (ch->frequency != ch->phaseIncFreq) {
+            uint8_t divRatio = noiseParams & 0x07;
+            uint8_t shiftFreq = (noiseParams >> 4) & 0x0F;
+            /* bool shortMode = (noiseParams >> 3) & 1; */
 
-        uint32_t phaseInc = (uint32_t)(noiseFreq / sampleRate * 4294967296.0f);
+            float baseFreq = 524288.0f;
+            float divisor = (divRatio == 0) ? 0.5f : (float)divRatio;
+            float noiseFreq = baseFreq / divisor / (float)(1 << (shiftFreq + 1));
+
+            ch->phaseInc = (uint32_t)(noiseFreq / sampleRate * 4294967296.0f);
+            ch->phaseIncFreq = ch->frequency;
+        }
         uint32_t oldPhase = ch->phase;
-        ch->phase += phaseInc;
+        ch->phase += ch->phaseInc;
 
         /* Clock LFSR on phase wrap.
          * Bit 3 of frequency = period mode: 0 = 15-bit LFSR, 1 = 7-bit LFSR. */

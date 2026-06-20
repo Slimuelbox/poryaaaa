@@ -12,6 +12,15 @@ endif()
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
+# Default to an optimized build when the user hasn't picked a configuration.
+# This is a realtime audio engine; an unoptimized (-O0) default would run the
+# per-sample DSP roughly an order of magnitude slower than it needs to.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING
+        "Build type (Debug, Release, RelWithDebInfo, MinSizeRel)" FORCE)
+    message(STATUS "No CMAKE_BUILD_TYPE set; defaulting to Release")
+endif()
+
 # ---- CLAP SDK ----
 set(CLAP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory(clap-sdk)

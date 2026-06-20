@@ -200,6 +200,21 @@ typedef struct {
     uint32_t phase;         /* phase accumulator for synthesis */
     uint32_t *wavePointer;  /* programmable wave data */
 
+    /* Cached per-sample phase increment.  The increment derived from
+     * `frequency` is constant between tick-rate frequency updates, so it is
+     * recomputed (a couple of float divides) only when `frequency` changes
+     * rather than every rendered sample.  phaseIncFreq holds the `frequency`
+     * value phaseInc was computed for; a sentinel of 0xFFFFFFFF (set at note
+     * start) forces a recompute on the first sample of a note. */
+    uint32_t phaseInc;
+    uint32_t phaseIncFreq;
+
+    /* Cached DC-offset sum of the programmable-wave table (sum of all 32 raw
+     * nibbles).  Depends only on wavePointer contents, so it is recomputed
+     * only when wavePointer changes rather than every sample. */
+    int32_t waveSum;
+    uint32_t *waveSumPointer;
+
     uint16_t lfsr;          /* noise LFSR state */
 
     int trackIndex;
