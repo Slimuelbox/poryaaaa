@@ -167,6 +167,13 @@ typedef struct {
     int      origIndex; /* insertion order — used to make sort stable */
 } RawMidiEvent;
 
+/*
+ * Synthetic RenderEvent type for a tempo change.  Real MIDI channel-voice
+ * events use status nibbles 0x8..0xE, so 0x1 is free.  The target BPM is
+ * carried as a 14-bit value across data0 (low 7 bits) and data1 (high 7).
+ */
+#define RENDER_EVT_TEMPO 0x1
+
 /* A rendered event with its absolute sample position */
 typedef struct {
     uint64_t samplePos;
@@ -403,6 +410,22 @@ static uint64_t tick_to_sample(uint64_t tick,
     return (uint64_t)(samples + 0.5);
 }
 
+/* Build a synthetic tempo-change RenderEvent (BPM encoded as 14-bit). */
+static RenderEvent make_tempo_event(uint64_t samplePos, double bpm)
+{
+    int b = (int)(bpm + 0.5);
+    if (b < 1)      b = 1;
+    if (b > 0x3FFF) b = 0x3FFF;
+    RenderEvent ev;
+    ev.samplePos = samplePos;
+    ev.channel   = 0;
+    ev.track     = 0;
+    ev.type      = RENDER_EVT_TEMPO;
+    ev.data0     = (uint8_t)(b & 0x7F);
+    ev.data1     = (uint8_t)((b >> 7) & 0x7F);
+    return ev;
+}
+
 typedef struct {
     RenderEvent *events;
     int          count;
@@ -525,30 +548,84 @@ static RenderEventArray *parse_midi(const char *path, double sampleRate,
                                             tempos.events, tempos.count,
                                             tpqn, sampleRate);
 
-    /* ---- Build RenderEventArray ---- */
-    RenderEventArray *result = malloc(sizeof(*result));
-    if (!result) {
+    /* ---- Build RenderEventArray ----
+     *
+     * Note/CC/PC/PB events and tempo changes are merged into one
+     * sample-ordered stream.  Tempo changes become synthetic
+     * RENDER_EVT_TEMPO events so the render loop updates the engine's tempo
+     * at the right moment.  The engine's tempo drives LFO/vibrato (and
+     * portamento) speed; without this the engine would keep its init-default
+     * tempo and the LFO would run at the wrong rate (e.g. ~2x too fast for a
+     * 76 BPM song), diverging from the CLAP plugin which tracks host tempo. */
+
+    /* Note/CC/PC/PB events, already in tick (hence sample) order. */
+    RenderEvent *noteEvts = malloc((size_t)rawEvents.count * sizeof(RenderEvent));
+    if (rawEvents.count > 0 && !noteEvts) {
         free(rawEvents.events); free(tempos.events);
-        return NULL;
-    }
-    result->count  = rawEvents.count;
-    result->events = malloc((size_t)rawEvents.count * sizeof(RenderEvent));
-    if (!result->events) {
-        free(result); free(rawEvents.events); free(tempos.events);
         return NULL;
     }
     for (int i = 0; i < rawEvents.count; i++) {
         const RawMidiEvent *re = &rawEvents.events[i];
-        result->events[i].samplePos = tick_to_sample(re->tick,
-                                                      tempos.events, tempos.count,
-                                                      tpqn, sampleRate);
-        result->events[i].channel   = re->channel;
-        result->events[i].track     = re->track;
-        result->events[i].type      = re->type;
-        result->events[i].data0     = re->data0;
-        result->events[i].data1     = re->data1;
+        noteEvts[i].samplePos = tick_to_sample(re->tick,
+                                               tempos.events, tempos.count,
+                                               tpqn, sampleRate);
+        noteEvts[i].channel   = re->channel;
+        noteEvts[i].track     = re->track;
+        noteEvts[i].type      = re->type;
+        noteEvts[i].data0     = re->data0;
+        noteEvts[i].data1     = re->data1;
     }
 
+    /* Tempo-change events, also in tick order.  Prepend the SMF default of
+     * 120 BPM at sample 0 when the song does not set a tempo at its very
+     * start, so the engine never runs on its (unrelated) init default. */
+    bool needDefaultTempo = (tempos.count == 0 || tempos.events[0].tick != 0);
+    int  tempoEvtCount    = tempos.count + (needDefaultTempo ? 1 : 0);
+    RenderEvent *tempoEvts = malloc((size_t)(tempoEvtCount > 0 ? tempoEvtCount : 1)
+                                    * sizeof(RenderEvent));
+    if (!tempoEvts) {
+        free(noteEvts); free(rawEvents.events); free(tempos.events);
+        return NULL;
+    }
+    int te = 0;
+    if (needDefaultTempo)
+        tempoEvts[te++] = make_tempo_event(0, 120.0);
+    for (int i = 0; i < tempos.count; i++) {
+        uint64_t sp = tick_to_sample(tempos.events[i].tick,
+                                     tempos.events, tempos.count,
+                                     tpqn, sampleRate);
+        tempoEvts[te++] = make_tempo_event(sp, 60000000.0 / (double)tempos.events[i].tempo);
+    }
+
+    /* Merge the two sample-ordered lists.  On equal sample positions the
+     * tempo change is emitted first so it takes effect before the notes at
+     * that instant. */
+    RenderEventArray *result = malloc(sizeof(*result));
+    if (!result) {
+        free(tempoEvts); free(noteEvts); free(rawEvents.events); free(tempos.events);
+        return NULL;
+    }
+    int total = rawEvents.count + tempoEvtCount;
+    result->count  = total;
+    result->events = malloc((size_t)(total > 0 ? total : 1) * sizeof(RenderEvent));
+    if (!result->events) {
+        free(result); free(tempoEvts); free(noteEvts);
+        free(rawEvents.events); free(tempos.events);
+        return NULL;
+    }
+    {
+        int ni = 0, ti = 0, oi = 0;
+        while (ni < rawEvents.count || ti < tempoEvtCount) {
+            bool takeTempo;
+            if (ni >= rawEvents.count)        takeTempo = true;
+            else if (ti >= tempoEvtCount)     takeTempo = false;
+            else takeTempo = (tempoEvts[ti].samplePos <= noteEvts[ni].samplePos);
+            result->events[oi++] = takeTempo ? tempoEvts[ti++] : noteEvts[ni++];
+        }
+    }
+
+    free(tempoEvts);
+    free(noteEvts);
     free(rawEvents.events);
     free(tempos.events);
     return result;
@@ -661,6 +738,10 @@ static void dispatch_event(M4AEngine *engine, const RenderEvent *ev,
     int trackIdx = useTrackIndex ? ev->track : ev->channel;
 
     switch (ev->type) {
+    case RENDER_EVT_TEMPO: /* Synthetic tempo change — drives LFO/portamento rate */
+        m4a_engine_set_tempo_bpm(engine,
+                                 (double)(((int)ev->data1 << 7) | ev->data0));
+        break;
     case 0x8: /* Note Off */
         m4a_engine_note_off(engine, trackIdx, ev->data0);
         break;

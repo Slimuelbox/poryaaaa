@@ -812,6 +812,61 @@ static void test_pwm(void)
     m4a_engine_destroy(&engine);
 }
 
+/*
+ * The LFO (mod-wheel vibrato) advances inside the engine's tempo loop, so its
+ * rate is proportional to the tempo set via m4a_engine_set_tempo_bpm: each
+ * VBlank tick adds tempoI to an accumulator and the LFO steps once per 150
+ * accumulated.  This is the contract poryaaaa_render relies on — it must feed
+ * the MIDI tempo into the engine, otherwise the LFO runs at the init-default
+ * tempo and ends up the wrong speed (the bug where a 76 BPM song's vibrato ran
+ * ~2x too fast because the renderer left the engine at its 150 default).
+ */
+static void test_lfo_tempo_scaling(void)
+{
+    printf("Testing LFO speed scales with tempo...\n");
+
+    /* lfoSpeed = 1 means the phase accumulator advances by exactly one LFO
+     * step per LFO tick, so lfoSpeedC directly counts the steps taken (as long
+     * as it stays below 256 and so does not wrap). */
+    const int TICKS = 100;
+
+    /* Fast: 150 BPM -> one LFO step per VBlank tick -> 100 steps. */
+    M4AEngine fast;
+    m4a_engine_init(&fast, 44100.0f);
+    m4a_engine_cc(&fast, 0, 0x15, 1);   /* LFOS: LFO speed */
+    m4a_engine_cc(&fast, 0, 0x1, 64);   /* mod wheel: LFO depth (must be nonzero) */
+    m4a_engine_set_tempo_bpm(&fast, 150.0);
+    for (int i = 0; i < TICKS; i++)
+        m4a_engine_tick(&fast);
+    int fastSteps = fast.tracks[0].lfoSpeedC;
+    ASSERT_EQ(fastSteps, 100, "lfo: 150 BPM steps once per VBlank");
+    m4a_engine_destroy(&fast);
+
+    /* Slow: 75 BPM -> one LFO step every other VBlank tick -> 50 steps. */
+    M4AEngine slow;
+    m4a_engine_init(&slow, 44100.0f);
+    m4a_engine_cc(&slow, 0, 0x15, 1);
+    m4a_engine_cc(&slow, 0, 0x1, 64);
+    m4a_engine_set_tempo_bpm(&slow, 75.0);
+    for (int i = 0; i < TICKS; i++)
+        m4a_engine_tick(&slow);
+    int slowSteps = slow.tracks[0].lfoSpeedC;
+    ASSERT_EQ(slowSteps, 50, "lfo: 75 BPM steps once per two VBlanks");
+    ASSERT_EQ(fastSteps, slowSteps * 2, "lfo: half tempo = half LFO rate");
+    m4a_engine_destroy(&slow);
+
+    /* With no mod depth the LFO stays put regardless of tempo. */
+    M4AEngine off;
+    m4a_engine_init(&off, 44100.0f);
+    m4a_engine_cc(&off, 0, 0x15, 1);    /* speed set... */
+    m4a_engine_cc(&off, 0, 0x1, 0);     /* ...but depth zero */
+    m4a_engine_set_tempo_bpm(&off, 150.0);
+    for (int i = 0; i < TICKS; i++)
+        m4a_engine_tick(&off);
+    ASSERT_EQ(off.tracks[0].lfoSpeedC, 0, "lfo: zero depth never advances");
+    m4a_engine_destroy(&off);
+}
+
 int main(void)
 {
     printf("=== M4A Engine Unit Tests ===\n\n");
@@ -827,6 +882,7 @@ int main(void)
     test_portamento();
     test_portamento_prev_key_tracking();
     test_pwm();
+    test_lfo_tempo_scaling();
 
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;
