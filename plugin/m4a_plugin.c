@@ -192,6 +192,7 @@ static bool plugin_init(const clap_plugin_t *plugin)
     data->respectBaseMidiKey = false;
     data->portamentoEnabled = false;
     data->pwmEnabled = false;
+    data->polyDebugInvert = false;
     data->pcmMixRate = 13379.0f; /* GBA-accurate DirectSound mix rate by default */
     data->transportWasPlaying = false;
     data->projectRoot[0] = '\0';
@@ -232,6 +233,7 @@ static bool plugin_activate(const clap_plugin_t *plugin, double sample_rate,
     data->engine.respectBaseMidiKey = data->respectBaseMidiKey;
     m4a_engine_set_portamento_enabled(&data->engine, data->portamentoEnabled);
     m4a_engine_set_pwm_enabled(&data->engine, data->pwmEnabled);
+    m4a_engine_set_poly_debug_invert(&data->engine, data->polyDebugInvert);
     /* Apply the configured mix rate before setting the reverb amount, since it
      * rebuilds the reverb delay line for the new rate. */
     m4a_engine_set_pcm_mix_rate(&data->engine, data->pcmMixRate);
@@ -257,9 +259,9 @@ static bool plugin_activate(const clap_plugin_t *plugin, double sample_rate,
     /* Update voice data pointers for the GUI */
     if (data->gui) {
         if (data->loadedVg)
-            m4a_gui_set_voice_data(data->gui, data->loadedVg->voices, data->originalVoices, data->voiceOverrides);
+            m4a_gui_set_voice_data(data->gui, data->loadedVg->voices, data->originalVoices, data->voiceOverrides, data->loadedVg->voiceNames);
         else
-            m4a_gui_set_voice_data(data->gui, NULL, NULL, NULL);
+            m4a_gui_set_voice_data(data->gui, NULL, NULL, NULL, NULL);
     }
 
     /* Notify GUI of current voicegroup status */
@@ -277,6 +279,7 @@ static bool plugin_activate(const clap_plugin_t *plugin, double sample_rate,
         gs.respectBaseMidiKey = data->respectBaseMidiKey;
         gs.portamentoEnabled = data->portamentoEnabled;
         gs.pwmEnabled        = data->pwmEnabled;
+        gs.polyDebugInvert   = data->polyDebugInvert;
         gs.voicegroupLoaded  = (data->loadedVg != NULL);
         m4a_gui_update_settings(data->gui, &gs);
     }
@@ -288,7 +291,7 @@ static void plugin_deactivate(const clap_plugin_t *plugin)
 {
     M4APluginData *data = (M4APluginData *)plugin->plugin_data;
     if (data->gui)
-        m4a_gui_set_voice_data(data->gui, NULL, NULL, NULL);
+        m4a_gui_set_voice_data(data->gui, NULL, NULL, NULL, NULL);
     m4a_engine_destroy(&data->engine);
     data->activated = false;
 }
@@ -618,6 +621,7 @@ static bool state_load(const clap_plugin_t *plugin, const clap_istream_t *stream
         gs.respectBaseMidiKey = data->respectBaseMidiKey;
         gs.portamentoEnabled  = data->portamentoEnabled;
         gs.pwmEnabled         = data->pwmEnabled;
+        gs.polyDebugInvert    = data->polyDebugInvert;
         gs.reverbAmount     = data->reverbAmount;
         gs.masterVolume     = data->masterVolume;
         gs.songMasterVolume = data->songMasterVolume;
@@ -627,9 +631,9 @@ static bool state_load(const clap_plugin_t *plugin, const clap_istream_t *stream
         gs.voicegroupLoaded = (data->loadedVg != NULL);
         m4a_gui_update_settings(data->gui, &gs);
         if (data->loadedVg)
-            m4a_gui_set_voice_data(data->gui, data->loadedVg->voices, data->originalVoices, data->voiceOverrides);
+            m4a_gui_set_voice_data(data->gui, data->loadedVg->voices, data->originalVoices, data->voiceOverrides, data->loadedVg->voiceNames);
         else
-            m4a_gui_set_voice_data(data->gui, NULL, NULL, NULL);
+            m4a_gui_set_voice_data(data->gui, NULL, NULL, NULL, NULL);
     }
 
     return true;
@@ -688,6 +692,12 @@ static void timer_on_timer(const clap_plugin_t *plugin, clap_id timer_id)
     if (voicesChanged && data->activated)
         m4a_engine_refresh_voices(&data->engine);
 
+    /* Reset polyphony-overflow statistics if the user clicked Reset.  The
+     * engine struct is embedded in M4APluginData, so this is safe even while
+     * the plugin is deactivated. */
+    if (m4a_gui_poll_poly_reset(data->gui))
+        m4a_engine_reset_poly_stats(&data->engine);
+
     /* Apply any settings the user changed */
     M4AGuiSettings gs;
     bool reloadVoicegroup = false;
@@ -703,6 +713,7 @@ static void timer_on_timer(const clap_plugin_t *plugin, clap_id timer_id)
     data->respectBaseMidiKey = gs.respectBaseMidiKey;
     data->portamentoEnabled  = gs.portamentoEnabled;
     data->pwmEnabled         = gs.pwmEnabled;
+    data->polyDebugInvert    = gs.polyDebugInvert;
     data->pcmMixRate         = gs.pcmMixRate;
 
     if (data->activated) {
@@ -713,6 +724,7 @@ static void timer_on_timer(const clap_plugin_t *plugin, clap_id timer_id)
         data->engine.respectBaseMidiKey = gs.respectBaseMidiKey;
         m4a_engine_set_portamento_enabled(&data->engine, gs.portamentoEnabled);
         m4a_engine_set_pwm_enabled(&data->engine, gs.pwmEnabled);
+        m4a_engine_set_poly_debug_invert(&data->engine, gs.polyDebugInvert);
         /* Rebuilds the reverb delay line for the new rate; set amount after. */
         m4a_engine_set_pcm_mix_rate(&data->engine, gs.pcmMixRate);
         m4a_reverb_set_amount(&data->engine.reverb, gs.reverbAmount);
@@ -821,6 +833,7 @@ static bool gui_create(const clap_plugin_t *plugin, const char *api, bool is_flo
     gs.respectBaseMidiKey = data->respectBaseMidiKey;
     gs.portamentoEnabled  = data->portamentoEnabled;
     gs.pwmEnabled         = data->pwmEnabled;
+    gs.polyDebugInvert    = data->polyDebugInvert;
     gs.voicegroupLoaded = (data->loadedVg != NULL);
 
     data->gui = m4a_gui_create(data->host, &gs, s_pluginLogPath);
@@ -830,9 +843,14 @@ static bool gui_create(const clap_plugin_t *plugin, const char *api, bool is_flo
     }
     m4a_gui_set_internal_timer_callback(data->gui, gui_internal_timer_callback, (void *)plugin);
 
+    /* Read-only engine view for the realtime polyphony monitor.  The engine
+     * is embedded in M4APluginData, which outlives the GUI (CLAP destroys the
+     * GUI before the plugin), so the pointer stays valid. */
+    m4a_gui_set_engine(data->gui, &data->engine);
+
     /* Wire voice data pointers if voicegroup is already loaded */
     if (data->loadedVg)
-        m4a_gui_set_voice_data(data->gui, data->loadedVg->voices, data->originalVoices, data->voiceOverrides);
+        m4a_gui_set_voice_data(data->gui, data->loadedVg->voices, data->originalVoices, data->voiceOverrides, data->loadedVg->voiceNames);
 
     plugin_log("gui_create: success");
 

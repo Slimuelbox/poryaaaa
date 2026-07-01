@@ -174,6 +174,7 @@ The plugin opens a settings panel built with [Dear ImGui](https://github.com/oco
 
 - **General** tab — **Project Root** / **Voicegroup**: edit and press **Reload** to apply; **Song Volume** (0–127), **Reverb** (0–127), **Polyphony**, **GBA Analog Filter**, and **PCM Mix Rate** take effect immediately
 - **Voices** tab — inspect and edit individual voices in the loaded voicegroup
+- **Polyphony** tab — realtime monitor for debugging polyphony overflow
 - **Options** menu — toggle the opt-in effect features (Respect Base MIDI Key, Portamento, Pulse-Width Modulation); hover an item for help text. Toggles take effect immediately and are saved per project.
 
 On Windows the GUI is embedded inside the DAW's FX window. On Linux/macOS it opens as a floating window.

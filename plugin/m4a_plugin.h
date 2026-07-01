@@ -23,6 +23,10 @@ typedef struct {
     bool respectBaseMidiKey;
     bool portamentoEnabled;
     bool pwmEnabled;
+    /* Polyphony-overflow debug: solo the sounds lost to the polyphony limit.
+     * Session-only -- deliberately NOT saved to config or CLAP state, so a
+     * project never reopens silently stuck in the debug listening mode. */
+    bool polyDebugInvert;
     bool activated;
     bool transportWasPlaying; /* last seen CLAP_TRANSPORT_IS_PLAYING state */
 

@@ -4,8 +4,19 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define MAX_PCM_CHANNELS 12
 #define MAX_CGB_CHANNELS 4
+/* The engine keeps a second "shadow" pool of channels after the real ones.
+ * Shadow channels never participate in normal note allocation; they exist so
+ * the polyphony-overflow debug mode can audibly play the sounds that were
+ * lost to the polyphony limit (dropped notes and the remainders of stolen
+ * notes).  Indices >= MAX_*_CHANNELS are shadow channels. */
+#define TOTAL_PCM_CHANNELS (MAX_PCM_CHANNELS * 2)
+#define TOTAL_CGB_CHANNELS (MAX_CGB_CHANNELS * 2)
 #define MAX_TRACKS 16
 #define VBLANK_RATE 59.7275f
 #define MAX_SONG_VOLUME 127 // called "mxv" in pokeemerald
@@ -225,6 +236,26 @@ typedef struct {
     int32_t declickSamplesRemaining; /* countdown; 0 = no declick active */
 } M4ACGBChannel;
 
+/* Polyphony-overflow debug events.  One is recorded whenever a sound is lost
+ * to the polyphony limit: a note-on that found no channel (DROPPED), an
+ * actively-sounding note cut off by a new note stealing its channel (STOLEN),
+ * or a releasing note whose tail was cut short the same way (TAIL_CUT). */
+#define M4A_POLY_DROPPED  0  /* note never sounded: no channel could be taken */
+#define M4A_POLY_STOLEN   1  /* active note cut off by a new note */
+#define M4A_POLY_TAIL_CUT 2  /* releasing note's tail cut off by a new note */
+
+typedef struct {
+    uint8_t type;       /* M4A_POLY_* */
+    uint8_t trackIndex; /* track whose sound was lost */
+    uint8_t midiKey;    /* MIDI key of the lost sound */
+    uint8_t byTrack;    /* STOLEN/TAIL_CUT: track of the note that took the channel */
+    uint8_t program;    /* losing track's program (voicegroup index) at event time */
+} M4APolyEvent;
+
+/* Ring-buffer capacity for recent overflow events (power of two not required;
+ * the ring index is polyEventTotal % capacity). */
+#define M4A_POLY_EVENT_CAPACITY 64
+
 /* Forward declaration */
 typedef struct M4AEngine M4AEngine;
 
@@ -233,8 +264,10 @@ typedef struct M4AEngine M4AEngine;
 /* Engine state */
 struct M4AEngine {
     M4ATrack tracks[MAX_TRACKS];
-    M4APCMChannel pcmChannels[MAX_PCM_CHANNELS];
-    M4ACGBChannel cgbChannels[MAX_CGB_CHANNELS];
+    /* First MAX_*_CHANNELS entries are the real channels; the second half is
+     * the shadow pool used only by the polyphony-overflow debug mode. */
+    M4APCMChannel pcmChannels[TOTAL_PCM_CHANNELS];
+    M4ACGBChannel cgbChannels[TOTAL_CGB_CHANNELS];
     M4AReverb reverb;
 
     float sampleRate;
@@ -267,6 +300,22 @@ struct M4AEngine {
     bool portamentoEnabled;  /* honor PORTAMENTO (CC 5) glides between notes */
     bool pwmEnabled;         /* honor pulse-width modulation (CC 0x17/0x19) */
     bool pwmActiveFlag;      /* true while any track has pulse-width modulation running */
+
+    /* Polyphony-overflow debugging.  Overflow events (dropped notes, stolen
+     * channels) are always counted; when polyDebugInvert is on, the normal
+     * audio output is muted and only the lost sounds are audible, played on
+     * the shadow channel pool.  The real channels keep running (muted) so the
+     * engine's allocation behavior is identical to normal playback.
+     * Written by the audio thread, read by the GUI thread without locking:
+     * all fields are small scalars, so torn reads are benign for a monitor.
+     * polyEventTotal is incremented after the ring entry is filled in, so the
+     * GUI never sees a half-written event. */
+    bool polyDebugInvert;
+    uint32_t polyDropCount[MAX_TRACKS];    /* notes that never sounded */
+    uint32_t polyStealCount[MAX_TRACKS];   /* active notes cut off */
+    uint32_t polyTailCutCount[MAX_TRACKS]; /* releasing tails cut off */
+    uint32_t polyEventTotal;               /* total events; ring head = total % capacity */
+    M4APolyEvent polyEvents[M4A_POLY_EVENT_CAPACITY];
 
     /* GBA analog output emulation: IIR low-pass filter */
     bool analogFilter;      /* enable/disable the hardware output filter */
@@ -326,6 +375,16 @@ void m4a_engine_reset_portamento(M4AEngine *engine);
 void m4a_engine_set_portamento_enabled(M4AEngine *engine, bool enabled);
 void m4a_engine_set_pwm_enabled(M4AEngine *engine, bool enabled);
 
+/* Polyphony-overflow debug mode: when enabled, normal playback is muted and
+ * only the sounds lost to the polyphony limit are audible (dropped notes and
+ * the remainders of stolen notes, played on the shadow channel pool).
+ * Disabling kills any shadow channels.  Overflow statistics are collected
+ * regardless of this flag. */
+void m4a_engine_set_poly_debug_invert(M4AEngine *engine, bool enabled);
+
+/* Clear the overflow counters and the recent-event ring. */
+void m4a_engine_reset_poly_stats(M4AEngine *engine);
+
 void m4a_engine_set_song_volume(M4AEngine *engine, uint8_t volume);
 
 /* Set tempo from DAW BPM.  The GBA relationship is tempoI ≈ BPM
@@ -350,5 +409,9 @@ static inline uint32_t umul3232H32(uint32_t a, uint32_t b)
 {
     return (uint32_t)(((uint64_t)a * (uint64_t)b) >> 32);
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* M4A_ENGINE_H */

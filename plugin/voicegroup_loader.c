@@ -1481,23 +1481,63 @@ static ToneData *load_sub_voicegroup(const char *projectRoot, const char *vgSymb
     ToneData *subVg = calloc(VOICEGROUP_SIZE, sizeof(ToneData));
     if (!subVg) return NULL;
 
-    ToneData savedVoices[VOICEGROUP_SIZE];
-    memcpy(savedVoices, vg->voices, sizeof(savedVoices));
+    /* The parser writes into vg->voices/voiceNames, so save the caller's
+     * top-level data around the sub-voicegroup parse.  Sub-voice names are
+     * discarded; only top-level names are kept (heap-allocated: the two
+     * arrays are ~30 KB, too big to risk on a plugin-load thread's stack). */
+    ToneData *savedVoices = malloc(sizeof(vg->voices));
+    char (*savedNames)[VG_VOICE_NAME_LEN] = malloc(sizeof(vg->voiceNames));
+    if (!savedVoices || !savedNames) {
+        free(savedVoices);
+        free(savedNames);
+        free(subVg);
+        return NULL;
+    }
+    memcpy(savedVoices, vg->voices, sizeof(vg->voices));
+    memcpy(savedNames, vg->voiceNames, sizeof(vg->voiceNames));
     memset(vg->voices, 0, sizeof(vg->voices));
+    memset(vg->voiceNames, 0, sizeof(vg->voiceNames));
 
     const char *startLabel = loc.label[0] ? loc.label : NULL;
-    if (parse_voicegroup_file(projectRoot, loc.filePath, startLabel,
-                               vg, dsMap, pwMap, ksMap, disc, waveCache) != 0) {
+    int parseResult = parse_voicegroup_file(projectRoot, loc.filePath, startLabel,
+                                            vg, dsMap, pwMap, ksMap, disc, waveCache);
+    if (parseResult == 0)
+        memcpy(subVg, vg->voices, sizeof(ToneData) * VOICEGROUP_SIZE);
+    memcpy(vg->voices, savedVoices, sizeof(vg->voices));
+    memcpy(vg->voiceNames, savedNames, sizeof(vg->voiceNames));
+    free(savedVoices);
+    free(savedNames);
+    if (parseResult != 0) {
         free(subVg);
-        memcpy(vg->voices, savedVoices, sizeof(savedVoices));
         return NULL;
     }
 
-    memcpy(subVg, vg->voices, sizeof(ToneData) * VOICEGROUP_SIZE);
-    memcpy(vg->voices, savedVoices, sizeof(savedVoices));
-
     vg_register_subgroup(vg, subVg);
     return subVg;
+}
+
+/*
+ * Store a friendly display name for a voice slot, derived from the symbol on
+ * the voice's line.  Common symbol prefixes are stripped for readability
+ * (e.g. "DirectSoundWaveData_sc88pro_trumpet" -> "sc88pro_trumpet").
+ */
+static void vg_set_voice_name(LoadedVoiceGroup *vg, int voiceIndex, const char *symbol)
+{
+    if (voiceIndex < 0 || voiceIndex >= VOICEGROUP_SIZE)
+        return;
+    static const char *prefixes[] = {
+        "DirectSoundWaveData_", "ProgrammableWaveData_", "voicegroup_",
+    };
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        size_t len = strlen(prefixes[i]);
+        if (strncmp(symbol, prefixes[i], len) == 0 && symbol[len] != '\0') {
+            symbol += len;
+            break;
+        }
+    }
+    /* Deliberate truncation into the fixed-size display name */
+    strncpy(vg->voiceNames[voiceIndex], symbol, VG_VOICE_NAME_LEN - 1);
+    vg->voiceNames[voiceIndex][VG_VOICE_NAME_LEN - 1] = '\0';
 }
 
 /*
@@ -1580,6 +1620,7 @@ static int parse_voicegroup_file(const char *projectRoot, const char *filePath,
             if (sscanf(trimmed + 30, "%d, %d, %[^,], %d, %d, %d, %d",
                        &key, &pan, sampleSymbol, &attack, &decay, &sustain, &release) == 7) {
                 rtrim(sampleSymbol);
+                vg_set_voice_name(vg, voiceIndex, sampleSymbol);
                 ToneData *td = &vg->voices[voiceIndex];
                 td->type = VOICE_DIRECTSOUND_NO_RESAMPLE;
                 td->key = (uint8_t)key;
@@ -1602,6 +1643,7 @@ static int parse_voicegroup_file(const char *projectRoot, const char *filePath,
             if (sscanf(trimmed + 22, "%d, %d, %[^,], %d, %d, %d, %d",
                        &key, &pan, sampleSymbol, &attack, &decay, &sustain, &release) == 7) {
                 rtrim(sampleSymbol);
+                vg_set_voice_name(vg, voiceIndex, sampleSymbol);
                 ToneData *td = &vg->voices[voiceIndex];
                 td->type = VOICE_DIRECTSOUND_ALT;
                 td->key = (uint8_t)key;
@@ -1624,6 +1666,7 @@ static int parse_voicegroup_file(const char *projectRoot, const char *filePath,
             if (sscanf(trimmed + 18, "%d, %d, %[^,], %d, %d, %d, %d",
                        &key, &pan, sampleSymbol, &attack, &decay, &sustain, &release) == 7) {
                 rtrim(sampleSymbol);
+                vg_set_voice_name(vg, voiceIndex, sampleSymbol);
                 ToneData *td = &vg->voices[voiceIndex];
                 td->type = VOICE_DIRECTSOUND;
                 td->key = (uint8_t)key;
@@ -1716,6 +1759,7 @@ static int parse_voicegroup_file(const char *projectRoot, const char *filePath,
             if (sscanf(trimmed + 27, "%d, %d, %[^,], %d, %d, %d, %d",
                        &key, &pan, waveSymbol, &attack, &decay, &sustain, &release) == 7) {
                 rtrim(waveSymbol);
+                vg_set_voice_name(vg, voiceIndex, waveSymbol);
                 ToneData *td = &vg->voices[voiceIndex];
                 td->type = VOICE_PROGRAMMABLE_WAVE_ALT;
                 td->key = (uint8_t)key;
@@ -1741,6 +1785,7 @@ static int parse_voicegroup_file(const char *projectRoot, const char *filePath,
             if (sscanf(trimmed + 23, "%d, %d, %[^,], %d, %d, %d, %d",
                        &key, &pan, waveSymbol, &attack, &decay, &sustain, &release) == 7) {
                 rtrim(waveSymbol);
+                vg_set_voice_name(vg, voiceIndex, waveSymbol);
                 ToneData *td = &vg->voices[voiceIndex];
                 td->type = VOICE_PROGRAMMABLE_WAVE;
                 td->key = (uint8_t)key;
@@ -1798,6 +1843,7 @@ static int parse_voicegroup_file(const char *projectRoot, const char *filePath,
             char vgSymbol[MAX_SYMBOL_LEN];
             if (sscanf(trimmed + 19, "%s", vgSymbol) == 1) {
                 rtrim(vgSymbol);
+                vg_set_voice_name(vg, voiceIndex, vgSymbol);
                 ToneData *td = &vg->voices[voiceIndex];
                 td->type = VOICE_KEYSPLIT_ALL;
 
@@ -1813,6 +1859,7 @@ static int parse_voicegroup_file(const char *projectRoot, const char *filePath,
             if (sscanf(trimmed + 15, "%[^,], %s", vgSymbol, ksSymbol) == 2) {
                 rtrim(vgSymbol);
                 rtrim(ksSymbol);
+                vg_set_voice_name(vg, voiceIndex, vgSymbol);
                 ToneData *td = &vg->voices[voiceIndex];
                 td->type = VOICE_KEYSPLIT;
 
@@ -1836,6 +1883,7 @@ static int parse_voicegroup_file(const char *projectRoot, const char *filePath,
             char sampleSymbol[MAX_SYMBOL_LEN];
             if (sscanf(trimmed + 12, "%s", sampleSymbol) == 1) {
                 rtrim(sampleSymbol);
+                vg_set_voice_name(vg, voiceIndex, sampleSymbol);
                 ToneData *td = &vg->voices[voiceIndex];
                 td->type = VOICE_CRY_REVERSE;
                 td->key = 60;
@@ -1859,6 +1907,7 @@ static int parse_voicegroup_file(const char *projectRoot, const char *filePath,
             char sampleSymbol[MAX_SYMBOL_LEN];
             if (sscanf(trimmed + 4, "%s", sampleSymbol) == 1) {
                 rtrim(sampleSymbol);
+                vg_set_voice_name(vg, voiceIndex, sampleSymbol);
                 ToneData *td = &vg->voices[voiceIndex];
                 td->type = VOICE_CRY;
                 td->key = 60;

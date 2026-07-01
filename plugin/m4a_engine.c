@@ -235,15 +235,19 @@ void m4a_engine_init(M4AEngine *engine, float sampleRate)
         track->pan = 0;
     }
 
-    /* Initialize CGB channels with proper types and pan masks */
-    engine->cgbChannels[0].type = 1;
-    engine->cgbChannels[0].panMask = 0x11;
-    engine->cgbChannels[1].type = 2;
-    engine->cgbChannels[1].panMask = 0x22;
-    engine->cgbChannels[2].type = 3;
-    engine->cgbChannels[2].panMask = 0x44;
-    engine->cgbChannels[3].type = 4;
-    engine->cgbChannels[3].panMask = 0x88;
+    /* Initialize CGB channels with proper types and pan masks.  The shadow
+     * pool (second half) mirrors the real channels one-to-one so a lost CGB
+     * sound plays on a shadow channel of the same type. */
+    for (int i = 0; i < TOTAL_CGB_CHANNELS; i += MAX_CGB_CHANNELS) {
+        engine->cgbChannels[i + 0].type = 1;
+        engine->cgbChannels[i + 0].panMask = 0x11;
+        engine->cgbChannels[i + 1].type = 2;
+        engine->cgbChannels[i + 1].panMask = 0x22;
+        engine->cgbChannels[i + 2].type = 3;
+        engine->cgbChannels[i + 2].panMask = 0x44;
+        engine->cgbChannels[i + 3].type = 4;
+        engine->cgbChannels[i + 3].panMask = 0x88;
+    }
 
     /* Initialize reverb at the PCM mix rate (the GBA reverb is a DirectSound
      * buffer effect that runs at the mixing rate, one VBlank frame of delay). */
@@ -310,18 +314,49 @@ void m4a_engine_refresh_voices(M4AEngine *engine)
 }
 
 /*
- * Allocate a PCM channel for a new note.
- * Matches the channel allocation logic in ply_note (m4a_1.s).
+ * Record a polyphony-overflow event: bump the per-track counter and append to
+ * the recent-event ring.  The ring entry is fully written before the total is
+ * bumped so a concurrent GUI reader never sees a half-written event.
+ */
+static void record_poly_event(M4AEngine *engine, uint8_t type, uint8_t trackIndex,
+                              uint8_t midiKey, uint8_t byTrack)
+{
+    uint8_t program = 0;
+    if (trackIndex < MAX_TRACKS) {
+        switch (type) {
+        case M4A_POLY_DROPPED:  engine->polyDropCount[trackIndex]++;    break;
+        case M4A_POLY_STOLEN:   engine->polyStealCount[trackIndex]++;   break;
+        case M4A_POLY_TAIL_CUT: engine->polyTailCutCount[trackIndex]++; break;
+        }
+        /* The losing track's current program identifies the instrument.  For
+         * stolen sounds this can in principle be stale (a program change after
+         * the note started), but that's rare and fine for a debug display. */
+        program = engine->tracks[trackIndex].currentProgram;
+    }
+    M4APolyEvent *ev = &engine->polyEvents[engine->polyEventTotal % M4A_POLY_EVENT_CAPACITY];
+    ev->type = type;
+    ev->trackIndex = trackIndex;
+    ev->midiKey = midiKey;
+    ev->byTrack = byTrack;
+    ev->program = program;
+    engine->polyEventTotal++;
+}
+
+/*
+ * Allocate a PCM channel for a new note from the pool [first, first+count).
+ * Matches the channel allocation logic in ply_note (m4a_1.s).  Normal notes
+ * allocate from [0, maxPcmChannels); the polyphony-overflow debug mode
+ * allocates lost sounds from the shadow pool with the same rules.
  */
 static M4APCMChannel *allocate_pcm_channel(M4AEngine *engine, uint8_t priority,
-                                            int trackIndex)
+                                            int trackIndex, int first, int count)
 {
     M4APCMChannel *best = NULL;
     uint8_t bestPriority = priority;
     int bestTrackIndex = trackIndex;
     int bestIsStopping = 0;
 
-    for (int i = 0; i < engine->maxPcmChannels; i++) {
+    for (int i = first; i < first + count; i++) {
         M4APCMChannel *ch = &engine->pcmChannels[i];
 
         if (!(ch->status & CHN_ON)) {
@@ -367,6 +402,29 @@ static M4APCMChannel *allocate_pcm_channel(M4AEngine *engine, uint8_t priority,
 }
 
 /*
+ * Polyphony-overflow debug mode: preserve a channel that is about to be
+ * stolen by copying its state into the shadow pool, where it keeps playing
+ * (audible only in invert mode).  Its track/key stay intact, so note-off,
+ * pitch, and volume updates keep applying to the survivor.  If the shadow
+ * pool itself is full, the lower-priority lost sound is simply not preserved.
+ */
+static void preserve_stolen_pcm(M4AEngine *engine, const M4APCMChannel *victim)
+{
+    M4APCMChannel *shadow = allocate_pcm_channel(engine, victim->priority,
+                                                 victim->trackIndex,
+                                                 MAX_PCM_CHANNELS, MAX_PCM_CHANNELS);
+    if (shadow)
+        *shadow = *victim;
+}
+
+static void preserve_stolen_cgb(M4AEngine *engine, const M4ACGBChannel *victim, int cgbIdx)
+{
+    /* One shadow slot per CGB channel type; a newer lost sound replaces an
+     * older one, mirroring the mono nature of the hardware channel. */
+    engine->cgbChannels[MAX_CGB_CHANNELS + cgbIdx] = *victim;
+}
+
+/*
  * Apply an interpolated portamento key (8.8 fixed point: (key << 8) | fine) to
  * every active, non-releasing channel on the track.  The track-level pitch
  * adjustments (key shift, bend, tune, vibrato) are layered on top, matching
@@ -381,7 +439,7 @@ static void apply_portamento_pitch(M4AEngine *engine, M4ATrack *track,
     else if (key > 178) key = 178;
     uint8_t fine = (uint8_t)(fullPitch & 0xFF);
 
-    for (int i = 0; i < MAX_PCM_CHANNELS; i++) {
+    for (int i = 0; i < TOTAL_PCM_CHANNELS; i++) {
         M4APCMChannel *ch = &engine->pcmChannels[i];
         if (!(ch->status & CHN_ON) || (ch->status & CHN_STOP)
             || ch->trackIndex != trackIndex || !ch->wav)
@@ -396,7 +454,7 @@ static void apply_portamento_pitch(M4AEngine *engine, M4ATrack *track,
         float scale = (float)pcmFreq / m4a_pcm_mix_rate(engine);
         ch->frequency = (uint32_t)((uint64_t)freq * divFreq * scale);
     }
-    for (int i = 0; i < MAX_CGB_CHANNELS; i++) {
+    for (int i = 0; i < TOTAL_CGB_CHANNELS; i++) {
         M4ACGBChannel *ch = &engine->cgbChannels[i];
         if (!(ch->status & CHN_ON) || (ch->status & CHN_STOP)
             || ch->trackIndex != trackIndex)
@@ -505,13 +563,30 @@ void m4a_engine_note_on(M4AEngine *engine, int trackIndex, uint8_t key, uint8_t 
         /* CGB channel */
         int cgbIdx = voiceType - 1;
         M4ACGBChannel *ch = &engine->cgbChannels[cgbIdx];
+        bool shadow = false;
 
         /* Check if we can steal this channel */
-        if ((ch->status & CHN_ON) && !(ch->status & CHN_STOP)) {
-            if (ch->priority > combinedPriority)
-                return;  /* can't steal */
-            if (ch->priority == combinedPriority && ch->trackIndex < trackIndex)
+        if ((ch->status & CHN_ON) && !(ch->status & CHN_STOP)
+            && (ch->priority > combinedPriority
+                || (ch->priority == combinedPriority && ch->trackIndex < trackIndex))) {
+            /* Can't steal: the note is lost to the polyphony limit.  In the
+             * overflow-debug invert mode it plays on the shadow channel of
+             * the same type instead; otherwise it's dropped. */
+            record_poly_event(engine, M4A_POLY_DROPPED, (uint8_t)trackIndex, key,
+                              (uint8_t)trackIndex);
+            if (!engine->polyDebugInvert)
                 return;
+            ch = &engine->cgbChannels[MAX_CGB_CHANNELS + cgbIdx];
+            shadow = true;
+        } else if ((ch->status & CHN_ON) && ch->trackIndex != trackIndex) {
+            /* Taking the channel from another track cuts that track's sound
+             * short.  Same-track retriggers are ordinary mono behavior on a
+             * CGB channel, not polyphony pressure, so they aren't recorded. */
+            record_poly_event(engine,
+                              (ch->status & CHN_STOP) ? M4A_POLY_TAIL_CUT : M4A_POLY_STOLEN,
+                              (uint8_t)ch->trackIndex, ch->midiKey, (uint8_t)trackIndex);
+            if (engine->polyDebugInvert)
+                preserve_stolen_cgb(engine, ch, cgbIdx);
         }
 
         /* Portamento legato: CGB tone types share one channel slot, so a
@@ -519,7 +594,8 @@ void m4a_engine_note_on(M4AEngine *engine, int trackIndex, uint8_t key, uint8_t 
          * at the moment of retrigger (zero gap).  In that case skip the note
          * trigger entirely -- keep the oscillator phase and envelope and put
          * the channel into sustain so it carries the previous note's state. */
-        bool portamentoInherit = engine->portamentoEnabled
+        bool portamentoInherit = !shadow
+                              && engine->portamentoEnabled
                               && track->portamentoDuration != 0
                               && (ch->status & CHN_ON)
                               && ch->envelopeVolume != 0;
@@ -555,8 +631,12 @@ void m4a_engine_note_on(M4AEngine *engine, int trackIndex, uint8_t key, uint8_t 
                 const PulseWidthModPattern *p = &gPulseWidthModPatterns[track->pwmPattern];
                 if (p->numSteps != 0) {
                     ch->dutyCycle = p->duty[0];
-                    track->pwmStep = 0;
-                    track->pwmSpeedCounter = track->pwmSpeed;
+                    /* A dropped (shadow) note never started on the GBA, so it
+                     * must not restart the track's modulation pattern. */
+                    if (!shadow) {
+                        track->pwmStep = 0;
+                        track->pwmSpeedCounter = track->pwmSpeed;
+                    }
                 }
             }
         } else if (voiceType == 3) {
@@ -575,13 +655,37 @@ void m4a_engine_note_on(M4AEngine *engine, int trackIndex, uint8_t key, uint8_t 
         else
             m4a_cgb_channel_start(ch);
 
-        portamento_note_started(engine, track, trackIndex, ch->key);
+        /* A dropped note never sounded on the GBA, so it must not become the
+         * start key of a later portamento glide. */
+        if (!shadow)
+            portamento_note_started(engine, track, trackIndex, ch->key);
     } else {
         /* PCM DirectSound channel */
         if (!voice->wav) return;
 
-        M4APCMChannel *ch = allocate_pcm_channel(engine, combinedPriority, trackIndex);
-        if (!ch) return;
+        bool shadow = false;
+        M4APCMChannel *ch = allocate_pcm_channel(engine, combinedPriority, trackIndex,
+                                                 0, engine->maxPcmChannels);
+        if (ch && (ch->status & CHN_ON)) {
+            /* Reusing an occupied channel cuts its current sound short. */
+            record_poly_event(engine,
+                              (ch->status & CHN_STOP) ? M4A_POLY_TAIL_CUT : M4A_POLY_STOLEN,
+                              (uint8_t)ch->trackIndex, ch->midiKey, (uint8_t)trackIndex);
+            if (engine->polyDebugInvert)
+                preserve_stolen_pcm(engine, ch);
+        } else if (!ch) {
+            /* No channel could be taken: the note is lost to the polyphony
+             * limit.  In the overflow-debug invert mode it plays on a shadow
+             * channel instead; otherwise it's dropped. */
+            record_poly_event(engine, M4A_POLY_DROPPED, (uint8_t)trackIndex, key,
+                              (uint8_t)trackIndex);
+            if (!engine->polyDebugInvert)
+                return;
+            ch = allocate_pcm_channel(engine, combinedPriority, trackIndex,
+                                      MAX_PCM_CHANNELS, MAX_PCM_CHANNELS);
+            if (!ch) return;
+            shadow = true;
+        }
 
         ch->midiKey = key;
         ch->key = (uint8_t)pcmKey;
@@ -628,8 +732,10 @@ void m4a_engine_note_on(M4AEngine *engine, int trackIndex, uint8_t key, uint8_t 
          * inherits its sample position, envelope, and loop state instead of
          * triggering a fresh attack/sample start, making the glide perfectly
          * smooth.  The previous channel is silenced so the two don't
-         * double-voice.  Disallowed if the voice changed (different wav). */
-        if (engine->portamentoEnabled && track->portamentoDuration != 0) {
+         * double-voice.  Disallowed if the voice changed (different wav).
+         * A shadow (dropped) note must not inherit -- or silence -- a real
+         * channel's state. */
+        if (!shadow && engine->portamentoEnabled && track->portamentoDuration != 0) {
             for (int i = 0; i < engine->maxPcmChannels; i++) {
                 M4APCMChannel *prev = &engine->pcmChannels[i];
                 if (prev == ch || !(prev->status & CHN_ON)
@@ -655,7 +761,10 @@ void m4a_engine_note_on(M4AEngine *engine, int trackIndex, uint8_t key, uint8_t 
             ch->envelopeVolumeLeft = ((uint32_t)ch->leftVolume * vol) >> 8;
         }
 
-        portamento_note_started(engine, track, trackIndex, ch->key);
+        /* A dropped note never sounded on the GBA, so it must not become the
+         * start key of a later portamento glide. */
+        if (!shadow)
+            portamento_note_started(engine, track, trackIndex, ch->key);
     }
 }
 
@@ -667,8 +776,9 @@ void m4a_engine_note_off(M4AEngine *engine, int trackIndex, uint8_t key)
     if (trackIndex < 0 || trackIndex >= MAX_TRACKS)
         return;
 
-    /* Stop matching PCM channels */
-    for (int i = 0; i < MAX_PCM_CHANNELS; i++) {
+    /* Stop matching PCM channels (shadow channels release too, so a lost
+     * sound audible in the overflow-debug mode ends at its note-off) */
+    for (int i = 0; i < TOTAL_PCM_CHANNELS; i++) {
         M4APCMChannel *ch = &engine->pcmChannels[i];
         if ((ch->status & CHN_ON) && !(ch->status & CHN_STOP)
             && ch->trackIndex == trackIndex && ch->midiKey == key) {
@@ -677,7 +787,7 @@ void m4a_engine_note_off(M4AEngine *engine, int trackIndex, uint8_t key)
     }
 
     /* Stop matching CGB channels */
-    for (int i = 0; i < MAX_CGB_CHANNELS; i++) {
+    for (int i = 0; i < TOTAL_CGB_CHANNELS; i++) {
         M4ACGBChannel *ch = &engine->cgbChannels[i];
         if ((ch->status & CHN_ON) && !(ch->status & CHN_STOP)
             && ch->trackIndex == trackIndex && ch->midiKey == key) {
@@ -694,7 +804,7 @@ void m4a_engine_note_off(M4AEngine *engine, int trackIndex, uint8_t key)
  */
 static void refresh_channel_pitches(M4AEngine *engine, M4ATrack *track, int trackIndex)
 {
-    for (int i = 0; i < MAX_PCM_CHANNELS; i++) {
+    for (int i = 0; i < TOTAL_PCM_CHANNELS; i++) {
         M4APCMChannel *ch = &engine->pcmChannels[i];
         if ((ch->status & CHN_ON) && ch->trackIndex == trackIndex && ch->wav) {
             int32_t finalKey = (int32_t)ch->key + track->keyM;
@@ -707,7 +817,7 @@ static void refresh_channel_pitches(M4AEngine *engine, M4ATrack *track, int trac
             ch->frequency = (uint32_t)((uint64_t)freq * divFreq * scale);
         }
     }
-    for (int i = 0; i < MAX_CGB_CHANNELS; i++) {
+    for (int i = 0; i < TOTAL_CGB_CHANNELS; i++) {
         M4ACGBChannel *ch = &engine->cgbChannels[i];
         if ((ch->status & CHN_ON) && ch->trackIndex == trackIndex) {
             int32_t finalKey = (int32_t)ch->key + track->keyM;
@@ -729,12 +839,12 @@ static void refresh_channel_pitches(M4AEngine *engine, M4ATrack *track, int trac
 static inline void refresh_volumes(M4AEngine *engine, M4ATrack *track, int trackIndex)
 {
     m4a_track_vol_pit_set(track);
-    for (int i = 0; i < MAX_PCM_CHANNELS; i++) {
+    for (int i = 0; i < TOTAL_PCM_CHANNELS; i++) {
         M4APCMChannel *ch = &engine->pcmChannels[i];
         if ((ch->status & CHN_ON) && ch->trackIndex == trackIndex)
             chn_vol_set(ch, track);
     }
-    for (int i = 0; i < MAX_CGB_CHANNELS; i++) {
+    for (int i = 0; i < TOTAL_CGB_CHANNELS; i++) {
         M4ACGBChannel *ch = &engine->cgbChannels[i];
         if ((ch->status & CHN_ON) && ch->trackIndex == trackIndex) {
             cgb_chn_vol_set(ch, track);
@@ -916,12 +1026,12 @@ void m4a_engine_all_notes_off(M4AEngine *engine, int trackIndex)
 {
     if (trackIndex < 0 || trackIndex >= MAX_TRACKS)
         return;
-    for (int i = 0; i < MAX_PCM_CHANNELS; i++) {
+    for (int i = 0; i < TOTAL_PCM_CHANNELS; i++) {
         M4APCMChannel *ch = &engine->pcmChannels[i];
         if ((ch->status & CHN_ON) && ch->trackIndex == trackIndex)
             ch->status |= CHN_STOP;
     }
-    for (int i = 0; i < MAX_CGB_CHANNELS; i++) {
+    for (int i = 0; i < TOTAL_CGB_CHANNELS; i++) {
         M4ACGBChannel *ch = &engine->cgbChannels[i];
         if ((ch->status & CHN_ON) && ch->trackIndex == trackIndex)
             ch->status |= CHN_STOP;
@@ -934,9 +1044,9 @@ void m4a_engine_all_notes_off(M4AEngine *engine, int trackIndex)
  */
 void m4a_engine_all_sound_off(M4AEngine *engine)
 {
-    for (int i = 0; i < MAX_PCM_CHANNELS; i++)
+    for (int i = 0; i < TOTAL_PCM_CHANNELS; i++)
         engine->pcmChannels[i].status = 0;
-    for (int i = 0; i < MAX_CGB_CHANNELS; i++)
+    for (int i = 0; i < TOTAL_CGB_CHANNELS; i++)
         engine->cgbChannels[i].status = 0;
     m4a_engine_reset_portamento(engine);
 }
@@ -980,6 +1090,28 @@ void m4a_engine_set_pwm_enabled(M4AEngine *engine, bool enabled)
         }
         engine->pwmActiveFlag = false;
     }
+}
+
+void m4a_engine_set_poly_debug_invert(M4AEngine *engine, bool enabled)
+{
+    engine->polyDebugInvert = enabled;
+    if (!enabled) {
+        /* Kill the shadow pool: lost sounds only exist for the invert mode. */
+        for (int i = MAX_PCM_CHANNELS; i < TOTAL_PCM_CHANNELS; i++)
+            engine->pcmChannels[i].status = 0;
+        for (int i = MAX_CGB_CHANNELS; i < TOTAL_CGB_CHANNELS; i++) {
+            engine->cgbChannels[i].status = 0;
+            engine->cgbChannels[i].declickSamplesRemaining = 0;
+        }
+    }
+}
+
+void m4a_engine_reset_poly_stats(M4AEngine *engine)
+{
+    memset(engine->polyDropCount, 0, sizeof(engine->polyDropCount));
+    memset(engine->polyStealCount, 0, sizeof(engine->polyStealCount));
+    memset(engine->polyTailCutCount, 0, sizeof(engine->polyTailCutCount));
+    engine->polyEventTotal = 0;
 }
 
 void m4a_engine_set_song_volume(M4AEngine *engine, uint8_t volume)
@@ -1026,7 +1158,7 @@ static void m4a_lfo_tick(M4AEngine *engine)
             m4a_track_vol_pit_set(track);
 
             /* Update active channels for this track */
-            for (int j = 0; j < MAX_PCM_CHANNELS; j++) {
+            for (int j = 0; j < TOTAL_PCM_CHANNELS; j++) {
                 M4APCMChannel *ch = &engine->pcmChannels[j];
                 if ((ch->status & CHN_ON) && ch->trackIndex == i) {
                     chn_vol_set(ch, track);
@@ -1043,7 +1175,7 @@ static void m4a_lfo_tick(M4AEngine *engine)
                     }
                 }
             }
-            for (int j = 0; j < MAX_CGB_CHANNELS; j++) {
+            for (int j = 0; j < TOTAL_CGB_CHANNELS; j++) {
                 M4ACGBChannel *ch = &engine->cgbChannels[j];
                 if ((ch->status & CHN_ON) && ch->trackIndex == i) {
                     cgb_chn_vol_set(ch, track);
@@ -1162,8 +1294,9 @@ void m4a_engine_tick(M4AEngine *engine)
     else
         engine->c15 = 14;
 
-    /* Process PCM channel envelopes (VBlank rate) */
-    for (int i = 0; i < MAX_PCM_CHANNELS; i++) {
+    /* Process PCM channel envelopes (VBlank rate); the shadow pool keeps its
+     * envelopes running too so lost sounds evolve like real ones. */
+    for (int i = 0; i < TOTAL_PCM_CHANNELS; i++) {
         M4APCMChannel *ch = &engine->pcmChannels[i];
         if (ch->status & CHN_ON) {
             /* Decrement gate time */
@@ -1177,7 +1310,7 @@ void m4a_engine_tick(M4AEngine *engine)
     }
 
     /* Process CGB channel envelopes (VBlank rate) */
-    for (int i = 0; i < MAX_CGB_CHANNELS; i++) {
+    for (int i = 0; i < TOTAL_CGB_CHANNELS; i++) {
         M4ACGBChannel *ch = &engine->cgbChannels[i];
         if (ch->status & CHN_ON) {
             if (ch->gateTime > 0) {
@@ -1221,6 +1354,12 @@ void m4a_engine_process(M4AEngine *engine, float *outL, float *outR, int numSamp
      * rate (pcmMixRate == 0) collapses to one PCM sample per host sample. */
     float pcmStep = m4a_pcm_mix_rate(engine) / engine->sampleRate;
 
+    /* Polyphony-overflow debug: when inverted, the real channels still render
+     * (into a discarded accumulator, so sample positions, loop ends, and
+     * oscillator phases advance exactly as in normal playback) but only the
+     * shadow channels -- the sounds lost to the polyphony limit -- are heard. */
+    bool invert = engine->polyDebugInvert;
+
     for (int i = 0; i < numSamples; i++) {
         /* Check for engine tick (~60Hz) */
         engine->tickAccumulator += 1.0f;
@@ -1239,9 +1378,14 @@ void m4a_engine_process(M4AEngine *engine, float *outL, float *outR, int numSamp
             engine->pcmPrevR = engine->pcmCurR;
 
             int32_t pcmL = 0, pcmR = 0;
-            for (int ch = 0; ch < MAX_PCM_CHANNELS; ch++) {
-                if (engine->pcmChannels[ch].status & CHN_ON)
-                    m4a_pcm_channel_render(&engine->pcmChannels[ch], &pcmL, &pcmR);
+            int32_t mutedL = 0, mutedR = 0;  /* discarded output of muted channels */
+            for (int ch = 0; ch < TOTAL_PCM_CHANNELS; ch++) {
+                if (!(engine->pcmChannels[ch].status & CHN_ON))
+                    continue;
+                bool audible = ((ch >= MAX_PCM_CHANNELS) == invert);
+                m4a_pcm_channel_render(&engine->pcmChannels[ch],
+                                       audible ? &pcmL : &mutedL,
+                                       audible ? &pcmR : &mutedR);
             }
             /* Reverb is a GBA DirectSound-buffer effect: it runs at the PCM mix
              * rate, before the upsample and before CGB is added. */
@@ -1261,9 +1405,15 @@ void m4a_engine_process(M4AEngine *engine, float *outL, float *outR, int numSamp
         /* CGB channels are oscillators synthesized directly at the host rate,
          * so they are mixed in after the PCM upsample.  They are not reverbed,
          * matching the GBA where reverb only touches the DirectSound buffer. */
-        for (int ch = 0; ch < MAX_CGB_CHANNELS; ch++) {
-            m4a_cgb_channel_render(&engine->cgbChannels[ch], &mixL, &mixR,
-                                   engine->sampleRate);
+        {
+            int32_t mutedL = 0, mutedR = 0;
+            for (int ch = 0; ch < TOTAL_CGB_CHANNELS; ch++) {
+                bool audible = ((ch >= MAX_CGB_CHANNELS) == invert);
+                m4a_cgb_channel_render(&engine->cgbChannels[ch],
+                                       audible ? &mixL : &mutedL,
+                                       audible ? &mixR : &mutedR,
+                                       engine->sampleRate);
+            }
         }
 
 

@@ -413,6 +413,218 @@ static void test_polyphony_stealing(void)
     free(wd);
 }
 
+/* Polyphony-overflow debugging: lost sounds are counted per track and logged
+ * to the event ring; the invert mode mutes normal playback and plays the lost
+ * sounds on the shadow channel pool instead. */
+static void test_poly_overflow_debug(void)
+{
+    printf("Testing polyphony overflow debugging...\n");
+
+    /* Looped WaveData so notes keep sounding until note-off */
+    int dataSize = 64;
+    WaveData *wd = calloc(1, sizeof(WaveData) + dataSize + 1);
+    wd->type = 0;
+    wd->status = 0xC000;  /* looped */
+    wd->freq = 0x01000000;
+    wd->loopStart = 0;
+    wd->size = dataSize;
+    wd->data = (int8_t *)((uint8_t *)wd + sizeof(WaveData));
+    for (int i = 0; i < dataSize; i++)
+        wd->data[i] = (int8_t)(127.0 * sin(2.0 * 3.14159265 * i / dataSize));
+    wd->data[dataSize] = wd->data[0];
+
+    ToneData voices[128];
+    memset(voices, 0, sizeof(voices));
+    voices[0].type = VOICE_DIRECTSOUND;
+    voices[0].key = 60;
+    voices[0].wav = wd;
+    voices[0].attack = 0xFF;
+    voices[0].decay = 0;
+    voices[0].sustain = 0xFF;
+    voices[0].release = 0;
+    voices[1].type = VOICE_SQUARE_1;
+    voices[1].key = 60;
+    voices[1].wavePointer = (uint32_t *)(uintptr_t)2;
+    voices[1].attack = 0;
+    voices[1].decay = 0;
+    voices[1].sustain = 15;
+    voices[1].release = 3;
+    voices[2] = voices[0];  /* distinct program for event-instrument tests */
+
+    M4AEngine engine;
+    float outL[1024], outR[1024];
+
+    /* ---- PCM drop is counted and logged; no shadow start when invert off ---- */
+    m4a_engine_init(&engine, 44100.0f);
+    m4a_engine_set_voicegroup(&engine, voices);
+    engine.maxPcmChannels = 1;
+    m4a_engine_program_change(&engine, 0, 0);
+    m4a_engine_program_change(&engine, 1, 2);
+    m4a_engine_note_on(&engine, 0, 60, 100);
+    /* Equal priority and the occupant's trackIndex (0) is lower than the new
+     * note's (1), so the new note has no victim and is dropped. */
+    m4a_engine_note_on(&engine, 1, 67, 100);
+    ASSERT_EQ(engine.polyDropCount[1], 1, "poly: PCM drop counted for track");
+    ASSERT_EQ(engine.polyEventTotal, 1, "poly: drop logged one event");
+    ASSERT_EQ(engine.polyEvents[0].type, M4A_POLY_DROPPED, "poly: event type dropped");
+    ASSERT_EQ(engine.polyEvents[0].trackIndex, 1, "poly: event track");
+    ASSERT_EQ(engine.polyEvents[0].midiKey, 67, "poly: event key");
+    ASSERT_EQ(engine.polyEvents[0].program, 2, "poly: event records losing track's program");
+    {
+        int shadowActive = 0;
+        for (int i = MAX_PCM_CHANNELS; i < TOTAL_PCM_CHANNELS; i++)
+            if (engine.pcmChannels[i].status & CHN_ON) shadowActive = 1;
+        ASSERT(!shadowActive, "poly: no shadow channel without invert mode");
+    }
+    m4a_engine_destroy(&engine);
+
+    /* ---- PCM steal is counted and attributed to the victim's track ---- */
+    m4a_engine_init(&engine, 44100.0f);
+    m4a_engine_set_voicegroup(&engine, voices);
+    engine.maxPcmChannels = 1;
+    m4a_engine_program_change(&engine, 0, 0);
+    m4a_engine_program_change(&engine, 1, 0);
+    m4a_engine_note_on(&engine, 1, 60, 100);
+    /* Equal priority, occupant trackIndex (1) >= new (0): the channel is stolen. */
+    m4a_engine_note_on(&engine, 0, 67, 100);
+    ASSERT_EQ(engine.polyStealCount[1], 1, "poly: steal counted for victim track");
+    ASSERT_EQ(engine.polyEvents[0].type, M4A_POLY_STOLEN, "poly: event type stolen");
+    ASSERT_EQ(engine.polyEvents[0].trackIndex, 1, "poly: steal victim track");
+    ASSERT_EQ(engine.polyEvents[0].midiKey, 60, "poly: steal victim key");
+    ASSERT_EQ(engine.polyEvents[0].byTrack, 0, "poly: steal attributed to new track");
+    m4a_engine_destroy(&engine);
+
+    /* ---- Tail cut: reusing a releasing channel is logged separately ---- */
+    m4a_engine_init(&engine, 44100.0f);
+    m4a_engine_set_voicegroup(&engine, voices);
+    engine.maxPcmChannels = 1;
+    voices[0].release = 220;  /* slow release so the tail is still alive */
+    m4a_engine_program_change(&engine, 0, 0);
+    m4a_engine_program_change(&engine, 1, 0);
+    m4a_engine_note_on(&engine, 1, 60, 100);
+    m4a_engine_note_off(&engine, 1, 60);
+    m4a_engine_note_on(&engine, 0, 67, 100);
+    ASSERT_EQ(engine.polyTailCutCount[1], 1, "poly: tail cut counted");
+    ASSERT_EQ(engine.polyEvents[0].type, M4A_POLY_TAIL_CUT, "poly: event type tail cut");
+    voices[0].release = 0;
+    m4a_engine_destroy(&engine);
+
+    /* ---- Invert mode: normal audio is muted, dropped note is audible ---- */
+    m4a_engine_init(&engine, 44100.0f);
+    m4a_engine_set_voicegroup(&engine, voices);
+    engine.maxPcmChannels = 1;
+    m4a_engine_set_poly_debug_invert(&engine, true);
+    m4a_engine_program_change(&engine, 0, 0);
+    m4a_engine_program_change(&engine, 1, 0);
+    m4a_engine_cc(&engine, 0, 7, 127);
+    m4a_engine_cc(&engine, 1, 7, 127);
+    m4a_engine_note_on(&engine, 0, 60, 100);
+    /* Only a normally-playing note: inverted output must be silent. */
+    m4a_engine_process(&engine, outL, outR, 1024);
+    {
+        float maxVal = 0;
+        for (int i = 0; i < 1024; i++) {
+            if (fabs(outL[i]) > maxVal) maxVal = fabs(outL[i]);
+            if (fabs(outR[i]) > maxVal) maxVal = fabs(outR[i]);
+        }
+        ASSERT(maxVal < 1e-9f, "poly invert: normal playback is muted");
+    }
+    /* ...but the muted channel still advances through its sample. */
+    ASSERT(engine.pcmChannels[0].currentPointer != wd->data
+           || engine.pcmChannels[0].fw != 0,
+           "poly invert: muted channel still advances");
+    /* Now drop a note: it should start on a shadow channel and be audible. */
+    m4a_engine_note_on(&engine, 1, 67, 100);
+    {
+        M4APCMChannel *shadow = NULL;
+        for (int i = MAX_PCM_CHANNELS; i < TOTAL_PCM_CHANNELS; i++)
+            if (engine.pcmChannels[i].status & CHN_ON) { shadow = &engine.pcmChannels[i]; break; }
+        ASSERT(shadow != NULL, "poly invert: dropped note plays on shadow channel");
+        ASSERT_EQ(shadow->trackIndex, 1, "poly invert: shadow channel track");
+        ASSERT_EQ(shadow->midiKey, 67, "poly invert: shadow channel key");
+    }
+    m4a_engine_process(&engine, outL, outR, 1024);
+    {
+        float maxVal = 0;
+        for (int i = 0; i < 1024; i++) {
+            if (fabs(outL[i]) > maxVal) maxVal = fabs(outL[i]);
+            if (fabs(outR[i]) > maxVal) maxVal = fabs(outR[i]);
+        }
+        ASSERT(maxVal > 0.001f, "poly invert: dropped note is audible");
+    }
+    /* Note-off releases the shadow note like a real one. */
+    m4a_engine_note_off(&engine, 1, 67);
+    {
+        int stopped = 0;
+        for (int i = MAX_PCM_CHANNELS; i < TOTAL_PCM_CHANNELS; i++)
+            if (engine.pcmChannels[i].status & CHN_STOP) stopped = 1;
+        ASSERT(stopped, "poly invert: note-off releases shadow channel");
+    }
+    /* Turning invert off kills the shadow pool. */
+    m4a_engine_set_poly_debug_invert(&engine, false);
+    {
+        int shadowActive = 0;
+        for (int i = MAX_PCM_CHANNELS; i < TOTAL_PCM_CHANNELS; i++)
+            if (engine.pcmChannels[i].status & CHN_ON) shadowActive = 1;
+        ASSERT(!shadowActive, "poly invert: disabling kills shadow channels");
+    }
+    m4a_engine_destroy(&engine);
+
+    /* ---- Invert mode: a stolen note's remainder survives on a shadow channel ---- */
+    m4a_engine_init(&engine, 44100.0f);
+    m4a_engine_set_voicegroup(&engine, voices);
+    engine.maxPcmChannels = 1;
+    m4a_engine_set_poly_debug_invert(&engine, true);
+    m4a_engine_program_change(&engine, 0, 0);
+    m4a_engine_program_change(&engine, 1, 0);
+    m4a_engine_note_on(&engine, 1, 60, 100);
+    m4a_engine_note_on(&engine, 0, 67, 100);  /* steals track 1's channel */
+    {
+        M4APCMChannel *shadow = NULL;
+        for (int i = MAX_PCM_CHANNELS; i < TOTAL_PCM_CHANNELS; i++)
+            if (engine.pcmChannels[i].status & CHN_ON) { shadow = &engine.pcmChannels[i]; break; }
+        ASSERT(shadow != NULL, "poly invert: stolen note preserved on shadow channel");
+        ASSERT_EQ(shadow->trackIndex, 1, "poly invert: preserved victim track");
+        ASSERT_EQ(shadow->midiKey, 60, "poly invert: preserved victim key");
+    }
+    m4a_engine_destroy(&engine);
+
+    /* ---- CGB: drop counted; invert plays it on the shadow CGB channel ---- */
+    m4a_engine_init(&engine, 44100.0f);
+    m4a_engine_set_voicegroup(&engine, voices);
+    m4a_engine_set_poly_debug_invert(&engine, true);
+    m4a_engine_program_change(&engine, 0, 1);  /* square 1 */
+    m4a_engine_program_change(&engine, 1, 1);
+    engine.tracks[0].priority = 5;
+    engine.tracks[1].priority = 3;
+    m4a_engine_note_on(&engine, 0, 60, 100);
+    m4a_engine_note_on(&engine, 1, 67, 100);   /* lower priority: dropped */
+    ASSERT_EQ(engine.polyDropCount[1], 1, "poly cgb: drop counted");
+    ASSERT(engine.cgbChannels[0].status & CHN_ON, "poly cgb: original note untouched");
+    ASSERT_EQ(engine.cgbChannels[0].trackIndex, 0, "poly cgb: original note owner");
+    ASSERT(engine.cgbChannels[MAX_CGB_CHANNELS].status & CHN_ON,
+           "poly cgb: dropped note plays on shadow square channel");
+    ASSERT_EQ(engine.cgbChannels[MAX_CGB_CHANNELS].trackIndex, 1,
+              "poly cgb: shadow channel track");
+    /* Cross-track CGB steal is recorded and the victim preserved. */
+    engine.tracks[2].priority = 7;
+    m4a_engine_program_change(&engine, 2, 1);
+    m4a_engine_note_on(&engine, 2, 72, 100);   /* steals track 0's square */
+    ASSERT_EQ(engine.polyStealCount[0], 1, "poly cgb: cross-track steal counted");
+    ASSERT_EQ(engine.cgbChannels[MAX_CGB_CHANNELS].trackIndex, 0,
+              "poly cgb: stolen victim replaces older shadow sound");
+    ASSERT_EQ(engine.cgbChannels[MAX_CGB_CHANNELS].midiKey, 60,
+              "poly cgb: preserved victim key");
+    /* Reset clears counters and the event ring. */
+    m4a_engine_reset_poly_stats(&engine);
+    ASSERT_EQ(engine.polyDropCount[1], 0, "poly: reset clears drop counts");
+    ASSERT_EQ(engine.polyStealCount[0], 0, "poly: reset clears steal counts");
+    ASSERT_EQ(engine.polyEventTotal, 0, "poly: reset clears event ring");
+    m4a_engine_destroy(&engine);
+
+    free(wd);
+}
+
 /* Find the active, non-releasing PCM channel for a track, or NULL */
 static M4APCMChannel *find_pcm_channel(M4AEngine *engine, int trackIndex)
 {
@@ -879,6 +1091,7 @@ int main(void)
     test_engine_init();
     test_basic_audio();
     test_polyphony_stealing();
+    test_poly_overflow_debug();
     test_portamento();
     test_portamento_prev_key_tracking();
     test_pwm();
