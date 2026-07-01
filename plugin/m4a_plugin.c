@@ -126,6 +126,11 @@ static void load_config_file(M4APluginData *data)
             data->portamentoEnabled = (atoi(value) != 0);
         } else if (strcmp(key, "pwm") == 0) {
             data->pwmEnabled = (atoi(value) != 0);
+        } else if (strcmp(key, "pcm_mix_rate") == 0) {
+            /* DirectSound mix rate in Hz; 0 = follow host rate. */
+            float v = (float)atof(value);
+            if (v < 0.0f) v = 0.0f;
+            data->pcmMixRate = v;
         } else if (strcmp(key, "max_channels") == 0) {
             int v = atoi(value);
             if (v < 1) v = 1;
@@ -187,6 +192,7 @@ static bool plugin_init(const clap_plugin_t *plugin)
     data->respectBaseMidiKey = false;
     data->portamentoEnabled = false;
     data->pwmEnabled = false;
+    data->pcmMixRate = 13379.0f; /* GBA-accurate DirectSound mix rate by default */
     data->transportWasPlaying = false;
     data->projectRoot[0] = '\0';
     data->voicegroupName[0] = '\0';
@@ -226,6 +232,9 @@ static bool plugin_activate(const clap_plugin_t *plugin, double sample_rate,
     data->engine.respectBaseMidiKey = data->respectBaseMidiKey;
     m4a_engine_set_portamento_enabled(&data->engine, data->portamentoEnabled);
     m4a_engine_set_pwm_enabled(&data->engine, data->pwmEnabled);
+    /* Apply the configured mix rate before setting the reverb amount, since it
+     * rebuilds the reverb delay line for the new rate. */
+    m4a_engine_set_pcm_mix_rate(&data->engine, data->pcmMixRate);
     m4a_reverb_set_amount(&data->engine.reverb, data->reverbAmount);
 
     /* If voicegroup is configured, load it */
@@ -264,6 +273,7 @@ static bool plugin_activate(const clap_plugin_t *plugin, double sample_rate,
         gs.songMasterVolume  = data->songMasterVolume;
         gs.analogFilter      = data->analogFilter;
         gs.maxPcmChannels    = data->maxPcmChannels;
+        gs.pcmMixRate        = data->pcmMixRate;
         gs.respectBaseMidiKey = data->respectBaseMidiKey;
         gs.portamentoEnabled = data->portamentoEnabled;
         gs.pwmEnabled        = data->pwmEnabled;
@@ -513,6 +523,9 @@ static bool state_save(const clap_plugin_t *plugin, const clap_ostream_t *stream
     if (stream->write(stream, &baseKeyByte, 1) != 1) return false;
     if (stream->write(stream, &portamentoByte, 1) != 1) return false;
     if (stream->write(stream, &pwmByte, 1) != 1) return false;
+    /* PCM mix rate (float, appended for back-compat with older saves) */
+    float pcmMixRate = data->pcmMixRate;
+    if (stream->write(stream, &pcmMixRate, sizeof(pcmMixRate)) != sizeof(pcmMixRate)) return false;
 
     return true;
 }
@@ -560,6 +573,13 @@ static bool state_load(const clap_plugin_t *plugin, const clap_istream_t *stream
     data->respectBaseMidiKey = (baseKeyByte != 0);
     data->portamentoEnabled  = (portamentoByte != 0);
     data->pwmEnabled         = (pwmByte != 0);
+    /* PCM mix rate is optional (absent in older saves); default to GBA-accurate.
+     * On a short/partial read, discard whatever was written and keep the default. */
+    float pcmMixRate = 13379.0f;
+    if (stream->read(stream, &pcmMixRate, sizeof(pcmMixRate)) != (int64_t)sizeof(pcmMixRate))
+        pcmMixRate = 13379.0f;
+    if (pcmMixRate < 0.0f) pcmMixRate = 0.0f;
+    data->pcmMixRate = pcmMixRate;
 
     if (data->activated) {
         /* Only reload voicegroup if the project root or name actually changed */
@@ -585,6 +605,7 @@ static bool state_load(const clap_plugin_t *plugin, const clap_istream_t *stream
         data->engine.respectBaseMidiKey = data->respectBaseMidiKey;
         m4a_engine_set_portamento_enabled(&data->engine, data->portamentoEnabled);
         m4a_engine_set_pwm_enabled(&data->engine, data->pwmEnabled);
+        m4a_engine_set_pcm_mix_rate(&data->engine, data->pcmMixRate);
         m4a_reverb_set_amount(&data->engine.reverb, data->reverbAmount);
     }
 
@@ -602,6 +623,7 @@ static bool state_load(const clap_plugin_t *plugin, const clap_istream_t *stream
         gs.songMasterVolume = data->songMasterVolume;
         gs.analogFilter     = data->analogFilter;
         gs.maxPcmChannels   = data->maxPcmChannels;
+        gs.pcmMixRate       = data->pcmMixRate;
         gs.voicegroupLoaded = (data->loadedVg != NULL);
         m4a_gui_update_settings(data->gui, &gs);
         if (data->loadedVg)
@@ -681,16 +703,19 @@ static void timer_on_timer(const clap_plugin_t *plugin, clap_id timer_id)
     data->respectBaseMidiKey = gs.respectBaseMidiKey;
     data->portamentoEnabled  = gs.portamentoEnabled;
     data->pwmEnabled         = gs.pwmEnabled;
+    data->pcmMixRate         = gs.pcmMixRate;
 
     if (data->activated) {
         data->engine.masterVolume = gs.masterVolume;
         m4a_engine_set_song_volume(&data->engine, gs.songMasterVolume);
-        m4a_reverb_set_amount(&data->engine.reverb, gs.reverbAmount);
         data->engine.analogFilter = gs.analogFilter;
         data->engine.maxPcmChannels = gs.maxPcmChannels;
         data->engine.respectBaseMidiKey = gs.respectBaseMidiKey;
         m4a_engine_set_portamento_enabled(&data->engine, gs.portamentoEnabled);
         m4a_engine_set_pwm_enabled(&data->engine, gs.pwmEnabled);
+        /* Rebuilds the reverb delay line for the new rate; set amount after. */
+        m4a_engine_set_pcm_mix_rate(&data->engine, gs.pcmMixRate);
+        m4a_reverb_set_amount(&data->engine.reverb, gs.reverbAmount);
     }
 
     if (reloadVoicegroup) {
@@ -792,6 +817,7 @@ static bool gui_create(const clap_plugin_t *plugin, const char *api, bool is_flo
     gs.songMasterVolume = data->songMasterVolume;
     gs.analogFilter     = data->analogFilter;
     gs.maxPcmChannels   = data->maxPcmChannels;
+    gs.pcmMixRate       = data->pcmMixRate;
     gs.respectBaseMidiKey = data->respectBaseMidiKey;
     gs.portamentoEnabled  = data->portamentoEnabled;
     gs.pwmEnabled         = data->pwmEnabled;

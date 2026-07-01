@@ -24,6 +24,13 @@ const PulseWidthModPattern gPulseWidthModPatterns[] =
 const uint8_t gNumPulseWidthModPatterns =
     sizeof(gPulseWidthModPatterns) / sizeof(gPulseWidthModPatterns[0]);
 
+/* Resolve the effective PCM mixing rate: the configured pcmMixRate, or the host
+ * sample rate when pcmMixRate is 0 ("follow host"). */
+static inline float m4a_pcm_mix_rate(const M4AEngine *engine)
+{
+    return engine->pcmMixRate > 0.0f ? engine->pcmMixRate : engine->sampleRate;
+}
+
 /*
  * MidiKeyToFreq - matches m4a.c
  * Converts MIDI key + fine adjust to a frequency word for PCM playback.
@@ -202,6 +209,12 @@ void m4a_engine_init(M4AEngine *engine, float sampleRate)
     engine->sampleRate = sampleRate;
     engine->samplesPerTick = sampleRate / VBLANK_RATE;
     engine->tickAccumulator = 0.0f;
+    /* Default to the GBA's hardware DirectSound mix rate so high notes alias
+     * the way they do in-game.  Set to 0 (follow host rate) for clean mixing. */
+    engine->pcmMixRate = 13379.0f;
+    engine->pcmResampleAccum = 0.0f;
+    engine->pcmPrevL = engine->pcmPrevR = 0;
+    engine->pcmCurL = engine->pcmCurR = 0;
     engine->masterVolume = 15;
     engine->songMasterVolume = MAX_SONG_VOLUME;
     engine->maxPcmChannels = 5;  /* default, matches Pokemon Emerald init */
@@ -232,13 +245,34 @@ void m4a_engine_init(M4AEngine *engine, float sampleRate)
     engine->cgbChannels[3].type = 4;
     engine->cgbChannels[3].panMask = 0x88;
 
-    /* Initialize reverb */
-    m4a_reverb_init(&engine->reverb, sampleRate, 0);
+    /* Initialize reverb at the PCM mix rate (the GBA reverb is a DirectSound
+     * buffer effect that runs at the mixing rate, one VBlank frame of delay). */
+    m4a_reverb_init(&engine->reverb, m4a_pcm_mix_rate(engine), 0);
 }
 
 void m4a_engine_destroy(M4AEngine *engine)
 {
     m4a_reverb_destroy(&engine->reverb);
+}
+
+void m4a_engine_set_pcm_mix_rate(M4AEngine *engine, float rate)
+{
+    /* 0 means "follow host rate"; otherwise clamp to a sane audio range. */
+    if (rate != 0.0f) {
+        if (rate < 1000.0f)   rate = 1000.0f;
+        if (rate > 192000.0f) rate = 192000.0f;
+    }
+    engine->pcmMixRate = rate;
+
+    /* The reverb delay line is sized for the mixing rate; rebuild it, keeping
+     * the current amount.  Reset the resampler so it restarts cleanly. */
+    uint8_t amount = engine->reverb.amount;
+    m4a_reverb_destroy(&engine->reverb);
+    m4a_reverb_init(&engine->reverb, m4a_pcm_mix_rate(engine), amount);
+
+    engine->pcmResampleAccum = 0.0f;
+    engine->pcmPrevL = engine->pcmPrevR = 0;
+    engine->pcmCurL = engine->pcmCurR = 0;
 }
 
 void m4a_engine_set_tempo_bpm(M4AEngine *engine, double bpm)
@@ -359,7 +393,7 @@ static void apply_portamento_pitch(M4AEngine *engine, M4ATrack *track,
         int32_t pcmSamplesPerVBlank = 224;
         int32_t pcmFreq = (597275 * pcmSamplesPerVBlank + 5000) / 10000;
         int32_t divFreq = (16777216 / pcmFreq + 1) >> 1;
-        float scale = (float)pcmFreq / engine->sampleRate;
+        float scale = (float)pcmFreq / m4a_pcm_mix_rate(engine);
         ch->frequency = (uint32_t)((uint64_t)freq * divFreq * scale);
     }
     for (int i = 0; i < MAX_CGB_CHANNELS; i++) {
@@ -572,7 +606,7 @@ void m4a_engine_note_on(M4AEngine *engine, int trackIndex, uint8_t key, uint8_t 
         {
             int32_t pcmSamplesPerVBlank = 224;
             int32_t pcmFreq = (597275 * pcmSamplesPerVBlank + 5000) / 10000;
-            float scale = (float)pcmFreq / engine->sampleRate;
+            float scale = (float)pcmFreq / m4a_pcm_mix_rate(engine);
 
             if (voice->type & VOICE_TYPE_FIX) {
                 /* Fixed-frequency (no resample): ignore MIDI key, play at GBA PCM rate.
@@ -669,7 +703,7 @@ static void refresh_channel_pitches(M4AEngine *engine, M4ATrack *track, int trac
             int32_t pcmSamplesPerVBlank = 224;
             int32_t pcmFreq = (597275 * pcmSamplesPerVBlank + 5000) / 10000;
             int32_t divFreq = (16777216 / pcmFreq + 1) >> 1;
-            float scale = (float)pcmFreq / engine->sampleRate;
+            float scale = (float)pcmFreq / m4a_pcm_mix_rate(engine);
             ch->frequency = (uint32_t)((uint64_t)freq * divFreq * scale);
         }
     }
@@ -1004,7 +1038,7 @@ static void m4a_lfo_tick(M4AEngine *engine)
                         int32_t pcmSamplesPerVBlank = 224;
                         int32_t pcmFreq = (597275 * pcmSamplesPerVBlank + 5000) / 10000;
                         int32_t divFreq = (16777216 / pcmFreq + 1) >> 1;
-                        float scale = (float)pcmFreq / engine->sampleRate;
+                        float scale = (float)pcmFreq / m4a_pcm_mix_rate(engine);
                         ch->frequency = (uint32_t)((uint64_t)freq * divFreq * scale);
                     }
                 }
@@ -1178,6 +1212,15 @@ void m4a_engine_tick(M4AEngine *engine)
  */
 void m4a_engine_process(M4AEngine *engine, float *outL, float *outR, int numSamples)
 {
+    /* Number of PCM-rate samples that elapse per host output sample.  When the
+     * mix rate is below the host rate (the GBA-accurate case, e.g. 13379 vs
+     * 44100), pcmStep < 1: each PCM sample spans several host samples and we
+     * linearly interpolate between the two most recent PCM samples.  This
+     * reproduces the hardware mixer's low-rate resampling -- including the
+     * aliasing that high notes produce in-game.  A mix rate equal to the host
+     * rate (pcmMixRate == 0) collapses to one PCM sample per host sample. */
+    float pcmStep = m4a_pcm_mix_rate(engine) / engine->sampleRate;
+
     for (int i = 0; i < numSamples; i++) {
         /* Check for engine tick (~60Hz) */
         engine->tickAccumulator += 1.0f;
@@ -1186,17 +1229,38 @@ void m4a_engine_process(M4AEngine *engine, float *outL, float *outR, int numSamp
             m4a_engine_tick(engine);
         }
 
-        /* Mix all active channels */
-        int32_t mixL = 0, mixR = 0;
+        /* Advance the PCM resample clock, generating a new PCM-rate sample
+         * (all DirectSound channels mixed + reverb) each time it crosses a
+         * whole sample boundary. */
+        engine->pcmResampleAccum += pcmStep;
+        while (engine->pcmResampleAccum >= 1.0f) {
+            engine->pcmResampleAccum -= 1.0f;
+            engine->pcmPrevL = engine->pcmCurL;
+            engine->pcmPrevR = engine->pcmCurR;
 
-        for (int ch = 0; ch < MAX_PCM_CHANNELS; ch++) {
-            if (engine->pcmChannels[ch].status & CHN_ON)
-                m4a_pcm_channel_render(&engine->pcmChannels[ch], &mixL, &mixR);
+            int32_t pcmL = 0, pcmR = 0;
+            for (int ch = 0; ch < MAX_PCM_CHANNELS; ch++) {
+                if (engine->pcmChannels[ch].status & CHN_ON)
+                    m4a_pcm_channel_render(&engine->pcmChannels[ch], &pcmL, &pcmR);
+            }
+            /* Reverb is a GBA DirectSound-buffer effect: it runs at the PCM mix
+             * rate, before the upsample and before CGB is added. */
+            m4a_reverb_process(&engine->reverb, &pcmL, &pcmR);
+
+            engine->pcmCurL = pcmL;
+            engine->pcmCurR = pcmR;
         }
 
-        /* Apply reverb */
-        m4a_reverb_process(&engine->reverb, &mixL, &mixR);
+        /* Linear interpolation of the PCM mix at this host-sample instant. */
+        float frac = engine->pcmResampleAccum;
+        int32_t mixL = engine->pcmPrevL
+                     + (int32_t)((float)(engine->pcmCurL - engine->pcmPrevL) * frac);
+        int32_t mixR = engine->pcmPrevR
+                     + (int32_t)((float)(engine->pcmCurR - engine->pcmPrevR) * frac);
 
+        /* CGB channels are oscillators synthesized directly at the host rate,
+         * so they are mixed in after the PCM upsample.  They are not reverbed,
+         * matching the GBA where reverb only touches the DirectSound buffer. */
         for (int ch = 0; ch < MAX_CGB_CHANNELS; ch++) {
             m4a_cgb_channel_render(&engine->cgbChannels[ch], &mixL, &mixR,
                                    engine->sampleRate);

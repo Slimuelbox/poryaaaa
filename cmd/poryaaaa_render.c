@@ -718,6 +718,7 @@ static void print_usage(const char *prog)
         "  --pwm                       Opt-in: enable pulse-width modulation on CGB square channels, CC 0x17/0x19 (default: off)\n"
         "  --polyphony <1-12>          Max simultaneous PCM channels (default: 5)\n"
         "  --sample-rate <hz>          Sample rate in Hz (default: 44100)\n"
+        "  --pcm-mix-rate <hz>         DirectSound (PCM) mix rate; 0 means same as sample-rate (default: 13379)\n"
         "  --tail <seconds>            Silence after last event, no loop markers (default: 3.0)\n"
         "\n"
         "Loop options (when MIDI contains '[' / ']' text events):\n"
@@ -797,6 +798,7 @@ int main(int argc, char *argv[])
     bool        pwm           = false;
     int         maxChannels   = 5;
     int         sampleRateHz  = 44100;
+    float       pcmMixRate    = 13379.0f; /* GBA-accurate DirectSound mix rate; 0 = host rate */
     double      tailSeconds   = 3.0;
     int         loopCount     = 2;
     double      fadeoutSeconds = 5.0;
@@ -832,6 +834,9 @@ int main(int argc, char *argv[])
         } else if (strcmp(argv[i], "--sample-rate") == 0 && i + 1 < argc) {
             sampleRateHz = atoi(argv[++i]);
             if (sampleRateHz < 8000) sampleRateHz = 8000;
+        } else if (strcmp(argv[i], "--pcm-mix-rate") == 0 && i + 1 < argc) {
+            pcmMixRate = (float)atof(argv[++i]);
+            if (pcmMixRate < 0.0f) pcmMixRate = 0.0f;
         } else if (strcmp(argv[i], "--tail") == 0 && i + 1 < argc) {
             tailSeconds = atof(argv[++i]);
             if (tailSeconds < 0.0) tailSeconds = 0.0;
@@ -1023,6 +1028,7 @@ oom:
     engine.respectBaseMidiKey = respectBaseMidiKey;
     m4a_engine_set_portamento_enabled(&engine, portamento);
     m4a_engine_set_pwm_enabled(&engine, pwm);
+    m4a_engine_set_pcm_mix_rate(&engine, pcmMixRate);
 
     /* ---- Allocate output buffers ---- */
     float *outL = calloc(totalSamples, sizeof(float));

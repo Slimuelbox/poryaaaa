@@ -36,6 +36,7 @@ Audio options:
   --analog-filter             Enable GBA analog low-pass filter (default: off)
   --polyphony <1-12>          Max simultaneous PCM channels (default: 5)
   --sample-rate <hz>          Sample rate in Hz (default: 44100)
+  --pcm-mix-rate <hz>         DirectSound (PCM) mix rate; 0 means same as sample-rate (default: 13379)
   --tail <seconds>            Silence after last event, no loop markers (default: 3.0)
 
 Opt-in effect features (off by default; extend the stock m4a engine):
@@ -155,6 +156,8 @@ The plugin reads `poryaaaa.cfg` on startup for initial defaults. All settings ca
 | `reverb` | `0` | Reverb amount (0–127) |
 | `master_volume` | `15` | M4A master volume (0–15) |
 | `song_master_volume` | `127` | Song-level volume multiplier (0–127) |
+| `max_channels` | `5` | Max simultaneous PCM (DirectSound) channels (1–12) |
+| `pcm_mix_rate` | `13379` | DirectSound (PCM) mix rate in Hz; `13379` = GBA-accurate aliasing, `0` = follow host rate (clean) |
 | `respect_base_midi_key` | `0` | Opt-in: treat a PCM voice's key as the sample's base MIDI note so pressed notes play at the intended pitch |
 | `portamento` | `0` | Opt-in: enable the portamento glide effect (CC 5 = glide time in ticks) |
 | `pwm` | `0` | Opt-in: enable pulse-width modulation on CGB square channels (CC 0x17 / 0x19) |
@@ -169,7 +172,7 @@ The opt-in effect features (`respect_base_midi_key`, `portamento`, `pwm`) requir
 
 The plugin opens a settings panel built with [Dear ImGui](https://github.com/ocornut/imgui) and [Pugl](https://github.com/lv2/pugl) (a lightweight embeddable windowing library):
 
-- **General** tab — **Project Root** / **Voicegroup**: edit and press **Reload** to apply; **Song Volume** (0–127), **Reverb** (0–127), **Polyphony**, and **GBA Analog Filter** take effect immediately
+- **General** tab — **Project Root** / **Voicegroup**: edit and press **Reload** to apply; **Song Volume** (0–127), **Reverb** (0–127), **Polyphony**, **GBA Analog Filter**, and **PCM Mix Rate** take effect immediately
 - **Voices** tab — inspect and edit individual voices in the loaded voicegroup
 - **Options** menu — toggle the opt-in effect features (Respect Base MIDI Key, Portamento, Pulse-Width Modulation); hover an item for help text. Toggles take effect immediately and are saved per project.
 
@@ -266,7 +269,7 @@ imgui/                   Dear ImGui (submodule)
 
 The engine runs a **tick** at the GBA's VBlank rate (~59.7 Hz) to advance envelopes and LFO, while rendering audio sample-by-sample at the configured sample rate (typically 44100 or 48000 Hz).
 
-**PCM channels** use the same 23-bit fractional sample position and linear interpolation as the GBA's `SoundMainRAM` mixer. Frequency is computed using `MidiKeyToFreq` with the exact scale/frequency table lookups, then scaled from the GBA's ~13379 Hz output rate to the target sample rate.
+**PCM channels** use the same 23-bit fractional sample position and linear interpolation as the GBA's `SoundMainRAM` mixer. Frequency is computed using `MidiKeyToFreq` with the exact scale/frequency table lookups. The channels (and the DirectSound reverb) are mixed at the configurable **PCM mix rate** — 13379 Hz by default, matching the GBA's hardware DirectSound rate — then linearly upsampled to the output sample rate. Because the hardware mixes at that low rate, pitched-up high notes alias below its ~6.7 kHz Nyquist exactly as they do in-game; raising the mix rate (up to "host rate") progressively removes that aliasing at the cost of accuracy. **CGB channels** are synthesized directly at the output rate and mixed in after the upsample.
 
 **CGB channels** are synthesized in software: square waves use an 8-step duty cycle pattern with a phase accumulator, programmable wave reads 4-bit nibbles from 16-byte waveforms, and noise uses a 15-bit LFSR.
 

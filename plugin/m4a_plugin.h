@@ -17,6 +17,8 @@ typedef struct {
     uint8_t songMasterVolume; // The song-level master volume (0-127)
     bool analogFilter;
     uint8_t maxPcmChannels;
+    /* DirectSound PCM mix rate in Hz (0 = follow host rate; 13379 = GBA). */
+    float pcmMixRate;
     /* Opt-in effect features (persisted; default off) */
     bool respectBaseMidiKey;
     bool portamentoEnabled;

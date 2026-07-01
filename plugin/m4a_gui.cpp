@@ -220,6 +220,42 @@ static void render_general_tab(M4AGuiState *gui)
             gui->settingsChanged = true;
         }
     }
+
+    {
+        /* DirectSound (PCM) mixing rate.  The m4a engine mixes PCM at a low-ish sample rate,
+         * so high notes alias audibly; higher rates progressively reduce that. */
+        static const char  *mixRateNames[]  = {
+            "13379 Hz (m4a's default)", "21024 Hz", "31536 Hz", "42048 Hz",
+            "Host rate (clean, no aliasing)"
+        };
+        static const float  mixRateValues[] = {
+            13379.0f, 21024.0f, 31536.0f, 42048.0f, 0.0f
+        };
+        const int mixRateCount = (int)(sizeof(mixRateValues) / sizeof(mixRateValues[0]));
+
+        int curIdx = -1;
+        for (int k = 0; k < mixRateCount; k++) {
+            if (gui->settings.pcmMixRate == mixRateValues[k]) { curIdx = k; break; }
+        }
+        const char *preview = (curIdx >= 0) ? mixRateNames[curIdx] : "Custom";
+        if (ImGui::BeginCombo("PCM Mix Rate", preview)) {
+            for (int k = 0; k < mixRateCount; k++) {
+                bool selected = (k == curIdx);
+                if (ImGui::Selectable(mixRateNames[k], selected)) {
+                    gui->settings.pcmMixRate = mixRateValues[k];
+                    gui->settingsChanged = true;
+                }
+                if (selected)
+                    ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SetItemTooltip(
+            "Rate the DirectSound (PCM) channels are mixed at before upsampling.\n"
+            "The m4a engine uses 13379 Hz by default, so high notes have aliasing.\n"
+            "Higher rates sound better, but are less accurate compared to in-game.");
+    }
+
     if (ImGui::Checkbox("GBA Analog Filter", &gui->settings.analogFilter))
         gui->settingsChanged = true;
 }
@@ -571,6 +607,7 @@ M4AGuiState *m4a_gui_create(const clap_host_t *host, const M4AGuiSettings *initi
         memset(&gui->settings, 0, sizeof(gui->settings));
         gui->settings.masterVolume     = 15;
         gui->settings.songMasterVolume = 127;
+        gui->settings.pcmMixRate       = 13379.0f;
     }
     sync_buffers(gui);
 

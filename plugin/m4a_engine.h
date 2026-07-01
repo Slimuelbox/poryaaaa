@@ -241,6 +241,18 @@ struct M4AEngine {
     float samplesPerTick;
     float tickAccumulator;
 
+    /* DirectSound (PCM) mixing rate.  On real hardware the m4a engine mixes all
+     * PCM channels at a fixed low rate (SOUND_MODE_FREQ, 13379 Hz in pokeemerald),
+     * so high notes alias heavily -- part of the GBA's characteristic sound.
+     * PCM channels are mixed + reverbed at this rate into an intermediate signal,
+     * then linearly upsampled to sampleRate.  0 means "follow sampleRate" (clean,
+     * alias-free mixing).  Default 13379 Hz for hardware accuracy. */
+    float pcmMixRate;
+    /* Linear-interpolation state for upsampling the PCM mix to the host rate. */
+    float pcmResampleAccum;
+    int32_t pcmPrevL, pcmPrevR;
+    int32_t pcmCurL, pcmCurR;
+
     uint8_t masterVolume;   /* 0-15 */
     uint8_t songMasterVolume; /* 0-127 */
     uint8_t maxPcmChannels; /* active PCM channel count */
@@ -279,6 +291,12 @@ struct M4AEngine {
 /* Engine lifecycle */
 void m4a_engine_init(M4AEngine *engine, float sampleRate);
 void m4a_engine_destroy(M4AEngine *engine);
+
+/* Set the DirectSound (PCM) mixing rate in Hz.  Pass 0 to follow the host
+ * sample rate (clean, alias-free mixing); pass 13379 for GBA-accurate aliasing.
+ * Reinitializes the reverb delay line for the new rate; call while stopped for a
+ * glitch-free change (active notes correct their pitch on the next event). */
+void m4a_engine_set_pcm_mix_rate(M4AEngine *engine, float rate);
 
 /* Set voicegroup (must be loaded by voicegroup_loader) */
 void m4a_engine_set_voicegroup(M4AEngine *engine, ToneData *voiceGroup);
