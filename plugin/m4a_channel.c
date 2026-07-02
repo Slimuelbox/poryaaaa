@@ -81,9 +81,11 @@ void m4a_pcm_channel_tick(M4APCMChannel *ch, uint8_t masterVolume)
     }
 
     if (ch->status & CHN_IEC) {
-        /* Pseudo-echo countdown */
+        /* Pseudo-echo countdown.  Signed check matches the GBA's subs/bhi:
+         * a starting length of 0 underflows and must stop the channel
+         * immediately rather than wrapping to 255. */
         ch->pseudoEchoLength--;
-        if (ch->pseudoEchoLength == 0) {
+        if ((int8_t)ch->pseudoEchoLength <= 0) {
             ch->status = 0;
             return;
         }
@@ -313,6 +315,13 @@ void m4a_cgb_channel_tick(M4ACGBChannel *ch, uint8_t c15)
     if (!(ch->status & CHN_ON))
         return;
 
+    /* Declared before the goto targets below: the start and release-start
+     * paths jump into the envelope block, and must see initialized values so
+     * they still honor the every-15th-frame double step (CgbSound initializes
+     * prevC15 before any of the equivalent branches). */
+    int doubleStep = (c15 == 0) ? 1 : 0;
+    int steps = 0;
+
     if (ch->status & CHN_START) {
         if (ch->status & CHN_STOP) {
             if (ch->type == 3)
@@ -365,9 +374,6 @@ void m4a_cgb_channel_tick(M4ACGBChannel *ch, uint8_t c15)
     }
 
     {
-        int doubleStep = (c15 == 0) ? 1 : 0;
-        int steps = 0;
-
 step_repeat:
         if (ch->envelopeCounter == 0) {
             m4a_cgb_mod_vol(ch);
@@ -522,7 +528,10 @@ void m4a_cgb_channel_render(M4ACGBChannel *ch, int32_t *mixL, int32_t *mixR,
              * 4-bit value, creating quantized "plateaus" in the output.
              * Apply the same volume logic to the mean for accurate DC removal. */
             int32_t shifted = (int32_t)nibble;
-            int nr32 = gCgb3Vol[ch->envelopeVolume];
+            /* envelopeVolume can exceed 15 (CgbModVol's center-pan goal is
+             * unclamped, up to 31); hardware truncates on the register write,
+             * so only the low 4 bits are audible. */
+            int nr32 = gCgb3Vol[ch->envelopeVolume & 0x0F];
             int32_t meanShifted;
             if (nr32 == 0) {
                 shifted = 0;
@@ -589,7 +598,10 @@ void m4a_cgb_channel_render(M4ACGBChannel *ch, int32_t *mixL, int32_t *mixR,
      * envelopeVolume is the 4-bit GBA hardware volume (0-15), matching what
      * CgbSound writes to NR12/NR22/NR42. */
     if (cgbType != 3) {
-        sample = (sample * ch->envelopeVolume) >> 4;
+        /* Mask to 4 bits: envelopeVolume can reach 31 (unclamped center-pan
+         * goal), but the NRx2 write is (envelopeVolume << 4) truncated to a
+         * byte, so hardware plays envelopeVolume & 0xF. */
+        sample = (sample * (ch->envelopeVolume & 0x0F)) >> 4;
     }
 
     /* Scale CGB to match the GBA hardware mixing ratio.

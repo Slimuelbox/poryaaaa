@@ -853,6 +853,23 @@ static inline void refresh_volumes(M4AEngine *engine, M4ATrack *track, int track
     }
 }
 
+/* Mirrors the GBA's clear_modM: zero the LFO accumulator and immediately push
+ * the recentered pitch (or volume, for modT 1/2) to every sounding channel on
+ * the track.  Without the push, a held note stays offset by the last LFO value
+ * until the next pitch/volume event, because m4a_lfo_tick skips tracks whose
+ * mod depth is 0. */
+static void clear_mod_m(M4AEngine *engine, M4ATrack *track, int trackIndex)
+{
+    track->lfoSpeedC = 0;
+    track->modM = 0;
+    if (track->modT == 0) {
+        m4a_track_vol_pit_set(track);
+        refresh_channel_pitches(engine, track, trackIndex);
+    } else {
+        refresh_volumes(engine, track, trackIndex);
+    }
+}
+
 /* Return the active CGB square channel (sq1/sq2) currently owned by a track,
  * or NULL if the track isn't driving a square channel.  Pulse-width modulation
  * only affects the two square-wave channels. */
@@ -881,10 +898,8 @@ void m4a_engine_cc(M4AEngine *engine, int trackIndex, uint8_t cc, uint8_t value)
     switch (cc) {
     case 0x1:  /* Mod wheel -> LFO depth */
         track->mod = value;
-        if (value == 0) {
-            track->lfoSpeedC = 0;
-            track->modM = 0;
-        }
+        if (value == 0)
+            clear_mod_m(engine, track, trackIndex);
         break;
     case 0x5:  /* Portamento time (PORTAMENTO) -- glide duration in song ticks, 0 = off.
                 * Opt-in: ignored unless the portamento feature is enabled.  Unlike
@@ -922,6 +937,8 @@ void m4a_engine_cc(M4AEngine *engine, int trackIndex, uint8_t cc, uint8_t value)
         track->lfoSpeed = value;
         track->lfoSpeedC = 0;
         track->modM = 0;
+        if (value == 0)
+            clear_mod_m(engine, track, trackIndex);
         break;
     case 0x16: /* Modulation type (MODT) */
         // TODO: none of the pokemon emerald songs use MODT
