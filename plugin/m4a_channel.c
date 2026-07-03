@@ -11,6 +11,26 @@
  * Matches the SoundMainRAM mixer in m4a_1.s
  */
 
+/*
+ * Advance the pulse synth's duty-cycle LFO one frame and recompute the phase
+ * threshold the oscillator is compared against.  Matches the pulse path of
+ * C_setup_synth in the improved mixer, which runs once per mixing frame:
+ * count (the GBA reuses the sample countdown field) accumulates the LFO step,
+ * the offset value is folded into a triangle wave with a bitwise NOT when
+ * negative, and the result scaled by the mod amount plus the base duty gives
+ * the threshold.  All arithmetic wraps at 32 bits like the ARM code.
+ */
+static void m4a_pcm_synth_pulse_update(M4APCMChannel *ch)
+{
+    const uint8_t *cfg = (const uint8_t *)ch->wav->data;
+    uint32_t lfo = (uint32_t)ch->count + ((uint32_t)cfg[3] << 24);
+    ch->count = (int32_t)lfo;
+    uint32_t folded = lfo + ((uint32_t)cfg[5] << 24);
+    if ((int32_t)folded < 0)
+        folded = ~folded;
+    ch->synthPulseDuty = ((uint32_t)cfg[2] << 24) + (folded >> 8) * cfg[4];
+}
+
 void m4a_pcm_channel_start(M4APCMChannel *ch, WaveData *wav, uint8_t type)
 {
     ch->wav = wav;
@@ -19,6 +39,30 @@ void m4a_pcm_channel_start(M4APCMChannel *ch, WaveData *wav, uint8_t type)
     ch->count = wav->size;
     ch->fw = 0;
     ch->envelopeVolume = 0;
+
+    /* Golden Sun synth voice: a zero-length sample is a synthesized-tone
+     * descriptor, not PCM data.  Matches C_channel_init_synth in the improved
+     * SoundMainRAM mixer. */
+    ch->synthType = M4A_SYNTH_NONE;
+    if (wav->size == 0 && wav->data) {
+        uint8_t waveType = (uint8_t)wav->data[1];
+        if (waveType == 0)
+            ch->synthType = M4A_SYNTH_PULSE;
+        else if (waveType == 1)
+            ch->synthType = M4A_SYNTH_SAW;
+        else
+            ch->synthType = M4A_SYNTH_TRIANGLE;
+        /* The triangle wave starts at 90 degrees phase so the note begins at
+         * the zero crossing instead of the negative peak (avoids a pop).  The
+         * GBA mixer only does this for the exact descriptor value 2. */
+        if (waveType == 2)
+            ch->fw = 0x40000000u;
+        /* Prime the duty threshold so the note doesn't render against a
+         * zero threshold before the first engine tick (on the GBA the frame
+         * that initializes the channel also runs C_setup_synth). */
+        if (ch->synthType == M4A_SYNTH_PULSE)
+            m4a_pcm_synth_pulse_update(ch);
+    }
 
     /* Check for loop - GBA checks wav->status bits 14-15 (0xC000) */
     ch->isLoop = (wav->status & 0xC000) != 0;
@@ -139,6 +183,11 @@ void m4a_pcm_channel_tick(M4APCMChannel *ch, uint8_t masterVolume)
     uint32_t vol = ((uint32_t)(masterVolume + 1) * envVol) >> 4;
     ch->envelopeVolumeRight = ((uint32_t)ch->rightVolume * vol) >> 8;
     ch->envelopeVolumeLeft = ((uint32_t)ch->leftVolume * vol) >> 8;
+
+    /* Golden Sun pulse synth: the duty-cycle LFO advances once per frame,
+     * mirroring C_setup_synth running once per SoundMainRAM call. */
+    if (ch->synthType == M4A_SYNTH_PULSE && ch->wav)
+        m4a_pcm_synth_pulse_update(ch);
 }
 
 /*
@@ -154,6 +203,55 @@ void m4a_pcm_channel_render(M4APCMChannel *ch, int32_t *mixL, int32_t *mixR)
 {
     if (!(ch->status & CHN_ON) || (ch->status & CHN_START))
         return;
+
+    /* Golden Sun synth voices generate their tone instead of reading sample
+     * data.  fw is the 32-bit oscillator phase (one wave period = 2^32),
+     * advanced by frequency << 3 per output sample -- the pitch of a
+     * 64-sample looped wave at the descriptor's header frequency.  Matches
+     * the C_synth_* loops in the improved SoundMainRAM mixer.
+     *
+     * The "value" amplitudes below are expressed relative to a normal
+     * sample's -128..127 range.  Careful when reading the assembly: the
+     * improved mixer's normal path accumulates samples at DOUBLE scale (its
+     * interpolation computes `base << 1` + `diff * frac >> 22`) against the
+     * halved 0-127 volume, while the synth loops use their raw values with
+     * the unhalved (pulse, triangle) or halved (saw) volume.  Folding that in
+     * gives equivalent amplitudes of +/-64 (pulse), ~+/-112 (saw, after its
+     * filter's DC gain of 2), and +/-128 (triangle) -- confirmed against
+     * agbplay, ipatix's reference player, which mixes these synths at 0.5 /
+     * ~0.875 / 1.0 of full scale respectively. */
+    if (ch->synthType != M4A_SYNTH_NONE) {
+        uint32_t phase = ch->fw;
+        int32_t value;
+        if (ch->synthType == M4A_SYNTH_PULSE) {
+            /* Compared against the duty threshold before the phase advances.
+             * GBA: +/-(vol << 6) at unhalved volume = equivalent +/-64. */
+            value = (phase < ch->synthPulseDuty) ? 64 : -64;
+            phase += ch->frequency << 3;
+        } else if (ch->synthType == M4A_SYNTH_SAW) {
+            /* Pseudo sawtooth: two rising ramps with a jump at mid-period,
+             * smoothed by a one-pole filter (y = x + y/2) kept in count at
+             * full precision.  The GBA mixes the filter state at halved
+             * volume; applied here as a final halving of the value. */
+            phase += ch->frequency << 3;
+            int32_t raw = (int32_t)(phase >> 24) - 0x70
+                        - (int32_t)((phase << 1) >> 27);
+            ch->count = raw + (ch->count >> 1);
+            value = ch->count >> 1;
+        } else {
+            /* Triangle ramping -128..+128 at unhalved volume = equivalent
+             * +/-128, i.e. exactly a full-scale sample. */
+            phase += ch->frequency << 3;
+            if ((int32_t)phase < 0)
+                value = 0x180 - (int32_t)(phase >> 23);
+            else
+                value = (int32_t)(phase >> 23) - 0x80;
+        }
+        ch->fw = phase;
+        *mixR += (value * ch->envelopeVolumeRight) >> 8;
+        *mixL += (value * ch->envelopeVolumeLeft) >> 8;
+        return;
+    }
 
     int8_t *ptr = ch->currentPointer;
     uint32_t fw = ch->fw;

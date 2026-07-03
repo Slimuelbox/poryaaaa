@@ -3,6 +3,7 @@
 #include <string.h>
 #include <math.h>
 #include "m4a_engine.h"
+#include "m4a_channel.h"
 #include "m4a_tables.h"
 
 /*
@@ -1079,6 +1080,178 @@ static void test_lfo_tempo_scaling(void)
     m4a_engine_destroy(&off);
 }
 
+/* Build a Golden Sun synth WaveData: a header with size == 0 followed by the
+ * waveform descriptor bytes (same layout as the duty/saw/triangle .bin
+ * samples used by ipatix's improved mixer). */
+static WaveData *make_synth_wave(const uint8_t *desc, int descLen)
+{
+    WaveData *wd = calloc(1, sizeof(WaveData) + 16 + 1);
+    wd->type = 0;
+    wd->status = 0x4000;      /* loop flag, as in the real synth samples */
+    wd->freq = 0x01058920;    /* 64-sample wave period = middle C at key 60 */
+    wd->loopStart = 0;
+    wd->size = 0;
+    wd->data = (int8_t *)((uint8_t *)wd + sizeof(WaveData));
+    memcpy(wd->data, desc, descLen);
+    return wd;
+}
+
+/* Golden Sun synth instruments: end-to-end engine behavior. */
+static void test_golden_sun_synth(void)
+{
+    printf("Testing Golden Sun synth instruments...\n");
+
+    static const uint8_t descTriangle[] = { 0x80, 0x02, 0x00, 0x00 };
+    static const uint8_t descSaw[]      = { 0x80, 0x01, 0x00, 0x00 };
+    static const uint8_t descPulse[]    = { 0x80, 0x00, 0x00, 0x20, 0x80, 0x10 };
+
+    WaveData *wdTri   = make_synth_wave(descTriangle, sizeof(descTriangle));
+    WaveData *wdSaw   = make_synth_wave(descSaw,      sizeof(descSaw));
+    WaveData *wdPulse = make_synth_wave(descPulse,    sizeof(descPulse));
+
+    ToneData voices[128];
+    memset(voices, 0, sizeof(voices));
+    for (int v = 0; v < 3; v++) {
+        voices[v].type = VOICE_DIRECTSOUND;
+        voices[v].key = 60;
+        voices[v].attack = 0xFF;   /* instant attack */
+        voices[v].sustain = 0xFF;
+    }
+    voices[0].wav = wdTri;
+    voices[1].wav = wdSaw;
+    voices[2].wav = wdPulse;
+
+    /* Each descriptor is classified and audible, and the channel never
+     * exhausts (a synth has no sample end). */
+    static const uint8_t expectType[3] =
+        { M4A_SYNTH_TRIANGLE, M4A_SYNTH_SAW, M4A_SYNTH_PULSE };
+    for (int v = 0; v < 3; v++) {
+        M4AEngine engine;
+        m4a_engine_init(&engine, 44100.0f);
+        m4a_engine_set_voicegroup(&engine, voices);
+        m4a_engine_program_change(&engine, 0, (uint8_t)v);
+        m4a_engine_cc(&engine, 0, 7, 127);
+        m4a_engine_note_on(&engine, 0, 60, 127);
+        ASSERT_EQ(engine.pcmChannels[0].synthType, expectType[v],
+                  "gs synth: descriptor classification");
+        if (expectType[v] == M4A_SYNTH_TRIANGLE) {
+            /* Triangle starts at 90 degrees phase to avoid a pop. */
+            ASSERT_EQ(engine.pcmChannels[0].fw, 0x40000000u,
+                      "gs synth: triangle 90-degree phase start");
+        }
+        if (expectType[v] == M4A_SYNTH_PULSE) {
+            /* First duty threshold from duty.bin's descriptor: the LFO
+             * accumulator advances one step (0x20 << 24), the offset
+             * (0x10 << 24) is added, and the positive result scaled by the
+             * mod amount 0x80: (0x30000000 >> 8) * 0x80 = 0x18000000. */
+            ASSERT_EQ(engine.pcmChannels[0].synthPulseDuty, 0x18000000u,
+                      "gs synth: initial pulse duty threshold");
+        }
+        float outL[8192], outR[8192];
+        m4a_engine_process(&engine, outL, outR, 8192);
+        float maxVal = 0;
+        for (int i = 0; i < 8192; i++)
+            if (fabsf(outL[i]) > maxVal) maxVal = fabsf(outL[i]);
+        ASSERT(maxVal > 0.01f, "gs synth: produces audio");
+        ASSERT((engine.pcmChannels[0].status & CHN_ON) != 0,
+               "gs synth: channel keeps playing (no sample end)");
+        m4a_engine_destroy(&engine);
+    }
+
+    free(wdTri);
+    free(wdSaw);
+    free(wdPulse);
+}
+
+/* Golden Sun synth waveform shapes: drive m4a_pcm_channel_render directly
+ * with a hand-built channel so the generated waveforms can be checked
+ * sample-by-sample against the GBA algorithm. */
+static void test_golden_sun_synth_waveforms(void)
+{
+    printf("Testing Golden Sun synth waveform shapes...\n");
+
+    /* Channel template: sustain state, unity-ish volume (128 -> value >> 1),
+     * frequency chosen so phase advances 0x800000 per sample = 512-sample
+     * wave period. */
+    M4APCMChannel base;
+    memset(&base, 0, sizeof(base));
+    base.status = CHN_ENV_SUSTAIN;
+    base.frequency = 0x100000;
+    base.envelopeVolumeLeft = 128;
+    base.envelopeVolumeRight = 128;
+
+    /* Triangle: equivalent amplitude is exactly a full-scale sample
+     * (+/-128); with the volume of 128 the output is value >> 1 = +/-64.
+     * From the 90-degree start it must begin at the zero crossing, rise
+     * monotonically to +64, and repeat with a 512-sample period. */
+    {
+        M4APCMChannel ch = base;
+        ch.synthType = M4A_SYNTH_TRIANGLE;
+        ch.fw = 0x40000000u;
+        int32_t out[1024];
+        int32_t maxV = -1000, minV = 1000;
+        for (int i = 0; i < 1024; i++) {
+            int32_t l = 0, r = 0;
+            m4a_pcm_channel_render(&ch, &l, &r);
+            out[i] = l;
+            if (l > maxV) maxV = l;
+            if (l < minV) minV = l;
+        }
+        ASSERT_EQ(out[0], 0, "gs triangle: starts at the zero crossing");
+        ASSERT_EQ(maxV, 64, "gs triangle: positive peak (full-scale equivalent)");
+        ASSERT_EQ(minV, -64, "gs triangle: negative peak");
+        int rising = 1;
+        for (int i = 1; i < 127; i++)
+            if (out[i] < out[i - 1]) rising = 0;
+        ASSERT(rising, "gs triangle: monotonic first quarter");
+        int periodic = 1;
+        for (int i = 0; i < 512; i++)
+            if (out[i] != out[i + 512]) periodic = 0;
+        ASSERT(periodic, "gs triangle: 512-sample period");
+    }
+
+    /* Pulse with a fixed 50% duty (base duty 0x80, no modulation): half the
+     * period high, half low, at +/-32 ((+/-64 * 128) >> 8) -- half the
+     * equivalent amplitude of a full-scale sample, matching agbplay. */
+    {
+        static const uint8_t desc[] = { 0x80, 0x00, 0x80, 0x00, 0x00, 0x00 };
+        WaveData *wd = make_synth_wave(desc, sizeof(desc));
+        M4APCMChannel ch = base;
+        ch.synthType = M4A_SYNTH_PULSE;
+        ch.wav = wd;
+        ch.synthPulseDuty = 0x80000000u;
+        int high = 0, low = 0, other = 0;
+        for (int i = 0; i < 512; i++) {
+            int32_t l = 0, r = 0;
+            m4a_pcm_channel_render(&ch, &l, &r);
+            if (l == 32) high++;
+            else if (l == -32) low++;
+            else other++;
+        }
+        ASSERT_EQ(high, 256, "gs pulse: 50 percent duty high samples");
+        ASSERT_EQ(low, 256, "gs pulse: 50 percent duty low samples");
+        ASSERT_EQ(other, 0, "gs pulse: output is strictly two-level");
+        free(wd);
+    }
+
+    /* Pseudo sawtooth: filter state settles to ~2x the raw wave (-112..112),
+     * mixed at halved volume for an equivalent amplitude of ~+/-112; with
+     * the volume of 128 the output lands in ~+/-56. */
+    {
+        M4APCMChannel ch = base;
+        ch.synthType = M4A_SYNTH_SAW;
+        int32_t maxV = -100000, minV = 100000;
+        for (int i = 0; i < 2048; i++) {
+            int32_t l = 0, r = 0;
+            m4a_pcm_channel_render(&ch, &l, &r);
+            if (l > maxV) maxV = l;
+            if (l < minV) minV = l;
+        }
+        ASSERT(maxV > 30 && maxV <= 56, "gs saw: positive range");
+        ASSERT(minV < -30 && minV >= -56, "gs saw: negative range");
+    }
+}
+
 int main(void)
 {
     printf("=== M4A Engine Unit Tests ===\n\n");
@@ -1096,6 +1269,8 @@ int main(void)
     test_portamento_prev_key_tracking();
     test_pwm();
     test_lfo_tempo_scaling();
+    test_golden_sun_synth();
+    test_golden_sun_synth_waveforms();
 
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

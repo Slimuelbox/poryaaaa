@@ -75,6 +75,11 @@ typedef struct {
 typedef struct {
     char symbol[MAX_SYMBOL_LEN];
     char filePath[MAX_PATH_LEN];
+    /* Inline Golden Sun synth definition (set_synth_* macros) instead of a
+     * sample file.  synthDesc holds the 6 descriptor bytes that follow a
+     * zero-size WaveData header (0x80, type, then 4 pulse parameters). */
+    uint8_t isSynth;
+    uint8_t synthDesc[6];
 } SymbolMapping;
 
 typedef struct {
@@ -291,6 +296,7 @@ static void symbol_map_add(SymbolMap *map, const char *symbol, const char *path)
         map->capacity = map->capacity ? map->capacity * 2 : INITIAL_CAPACITY;
         map->entries = realloc(map->entries, sizeof(SymbolMapping) * map->capacity);
     }
+    memset(&map->entries[map->count], 0, sizeof(SymbolMapping));
     strncpy(map->entries[map->count].symbol, symbol, MAX_SYMBOL_LEN - 1);
     map->entries[map->count].symbol[MAX_SYMBOL_LEN - 1] = '\0';
     strncpy(map->entries[map->count].filePath, path, MAX_PATH_LEN - 1);
@@ -298,11 +304,32 @@ static void symbol_map_add(SymbolMap *map, const char *symbol, const char *path)
     map->count++;
 }
 
+static void symbol_map_add_synth(SymbolMap *map, const char *symbol,
+                                 const uint8_t desc[6])
+{
+    symbol_map_add(map, symbol, "");
+    map->entries[map->count - 1].isSynth = 1;
+    memcpy(map->entries[map->count - 1].synthDesc, desc, 6);
+}
+
+/* Returns the file path for a symbol, or NULL if unknown.  Inline synth
+ * entries have no file and are deliberately not returned here; use
+ * symbol_map_find_synth for those. */
 static const char *symbol_map_find(const SymbolMap *map, const char *symbol)
 {
     for (int i = 0; i < map->count; i++) {
         if (strcmp(map->entries[i].symbol, symbol) == 0)
-            return map->entries[i].filePath;
+            return map->entries[i].isSynth ? NULL : map->entries[i].filePath;
+    }
+    return NULL;
+}
+
+/* Returns the 6 synth descriptor bytes for an inline synth symbol, or NULL. */
+static const uint8_t *symbol_map_find_synth(const SymbolMap *map, const char *symbol)
+{
+    for (int i = 0; i < map->count; i++) {
+        if (strcmp(map->entries[i].symbol, symbol) == 0)
+            return map->entries[i].isSynth ? map->entries[i].synthDesc : NULL;
     }
     return NULL;
 }
@@ -580,6 +607,13 @@ static void discover_project(const char *projectRoot,
     if (file_exists(path))
         pathlist_add(&out->directSoundDataFiles, path);
 
+    /* Inline Golden Sun synth definitions (pokeemerald-expansion layout);
+     * parsed by the same direct_sound_data parser, which recognizes the
+     * set_synth_* macros. */
+    build_path(path, sizeof(path), projectRoot, "sound/direct_sound_synth_data.inc");
+    if (file_exists(path))
+        pathlist_add(&out->directSoundDataFiles, path);
+
     build_path(path, sizeof(path), projectRoot, "sound/programmable_wave_data.inc");
     if (file_exists(path))
         pathlist_add(&out->progWaveDataFiles, path);
@@ -619,6 +653,52 @@ static void discover_project(const char *projectRoot,
 }
 
 /* ---- Symbol data file parsing (parameterized by file path) ---- */
+
+/*
+ * Parse a "set_synth_*" macro line into a Golden Sun synth descriptor (the 6
+ * bytes that follow a zero-size WaveData header).  Returns 1 and fills desc
+ * on success, 0 if the line is not a synth macro.  Recognized macros, with
+ * the pokeemerald-expansion names and the preferred aliases:
+ *   set_synth_custom p1, p2, p3, p4   /  set_synth_pulse p1, p2, p3, p4
+ *   set_synth_25                      /  set_synth_saw
+ *   set_synth_50                      /  set_synth_triangle
+ * For the pulse macros: p1 = base duty cycle, p2 = duty LFO step per frame,
+ * p3 = modulation amount, p4 = duty LFO phase offset (0x0-0xFF each).
+ */
+static int parse_synth_macro_line(const char *trimmed, uint8_t desc[6])
+{
+    static const struct { const char *name; uint8_t type; int hasParams; } kMacros[] = {
+        { "set_synth_custom",   0, 1 },
+        { "set_synth_pulse",    0, 1 },
+        { "set_synth_25",       1, 0 },
+        { "set_synth_saw",      1, 0 },
+        { "set_synth_50",       2, 0 },
+        { "set_synth_triangle", 2, 0 },
+    };
+
+    for (size_t m = 0; m < sizeof(kMacros) / sizeof(kMacros[0]); m++) {
+        size_t len = strlen(kMacros[m].name);
+        if (strncmp(trimmed, kMacros[m].name, len) != 0)
+            continue;
+        char next = trimmed[len];
+        if (next != '\0' && next != ' ' && next != '\t')
+            continue;  /* avoid e.g. "set_synth_50" matching "set_synth_5" */
+
+        memset(desc, 0, 6);
+        desc[0] = 0x80;
+        desc[1] = kMacros[m].type;
+        if (kMacros[m].hasParams) {
+            const char *p = trimmed + len;
+            for (int n = 0; n < 4; n++) {
+                while (*p == ' ' || *p == '\t' || *p == ',') p++;
+                if (!*p) break;
+                desc[2 + n] = (uint8_t)strtoul(p, (char **)&p, 0);
+            }
+        }
+        return 1;
+    }
+    return 0;
+}
 
 /*
  * Parse a direct_sound_data .inc file.
@@ -662,6 +742,14 @@ static int parse_direct_sound_data_file(const char *filePath, const char *projec
                 }
             }
             currentSymbol[0] = '\0';
+        }
+        /* Inline Golden Sun synth definitions (set_synth_* macros) */
+        else if (currentSymbol[0]) {
+            uint8_t desc[6];
+            if (parse_synth_macro_line(trimmed, desc)) {
+                symbol_map_add_synth(map, currentSymbol, desc);
+                currentSymbol[0] = '\0';
+            }
         }
     }
 
@@ -1137,7 +1225,13 @@ static WaveData *load_wave_data(const char *projectRoot, const char *relativePat
     uint32_t loopStart = header[8] | (header[9] << 8) | (header[10] << 16) | (header[11] << 24);
     uint32_t size = header[12] | (header[13] << 8) | (header[14] << 16) | (header[15] << 24);
 
-    WaveData *wd = malloc(sizeof(WaveData) + size + 1);
+    /* A zero-length sample is a Golden Sun synth-instrument descriptor
+     * (ipatix improved-mixer feature): the bytes after the header select the
+     * waveform and pulse parameters instead of holding PCM data.  Keep up to
+     * 16 descriptor bytes so the engine can read them. */
+    uint32_t dataSize = (size > 0) ? size : 16;
+
+    WaveData *wd = malloc(sizeof(WaveData) + dataSize + 1);
     if (!wd) {
         fclose(f);
         return NULL;
@@ -1152,11 +1246,11 @@ static WaveData *load_wave_data(const char *projectRoot, const char *relativePat
     wd->size = size;
     wd->data = (int8_t *)((uint8_t *)wd + sizeof(WaveData));
 
-    size_t bytesRead = fread(wd->data, 1, size, f);
-    if (bytesRead < size) {
-        memset(wd->data + bytesRead, 0, size - bytesRead);
+    size_t bytesRead = fread(wd->data, 1, dataSize, f);
+    if (bytesRead < dataSize) {
+        memset(wd->data + bytesRead, 0, dataSize - bytesRead);
     }
-    wd->data[size] = wd->data[size > 0 ? size - 1 : 0];
+    wd->data[dataSize] = wd->data[dataSize - 1];
 
     fclose(f);
     return wd;
@@ -1219,6 +1313,33 @@ static WaveData *resolve_and_load_sample(const char *projectRoot, const char *sy
                                           const SymbolMap *dsMap, const ProjectDiscovery *disc,
                                           LoadedVoiceGroup *vg, WaveCache *waveCache)
 {
+    /* Inline Golden Sun synth definition (set_synth_* macros)?  Build the
+     * WaveData directly: the standard synth header (loop flag, freq
+     * 0x01058920 so the 64-sample wave period lands on middle C, size 0)
+     * followed by the descriptor bytes -- byte-identical to what the macros
+     * assemble on the GBA and to the equivalent .bin sample files. */
+    const uint8_t *synthDesc = symbol_map_find_synth(dsMap, symbol);
+    if (synthDesc) {
+        char cacheKey[MAX_PATH_LEN];
+        snprintf(cacheKey, sizeof(cacheKey), "synth-macro:%s", symbol);
+        WaveData *cached = wave_cache_find(waveCache, cacheKey);
+        if (cached) return cached;
+
+        uint32_t dataSize = 16;
+        WaveData *wd = calloc(1, sizeof(WaveData) + dataSize + 1);
+        if (!wd) return NULL;
+        wd->type = 0;
+        wd->status = 0x4000;
+        wd->freq = 0x01058920;
+        wd->loopStart = 0;
+        wd->size = 0;
+        wd->data = (int8_t *)((uint8_t *)wd + sizeof(WaveData));
+        memcpy(wd->data, synthDesc, 6);
+        vg_register_wavedata(vg, wd);
+        wave_cache_insert(waveCache, cacheKey, wd);
+        return wd;
+    }
+
     const char *samplePath = symbol_map_find(dsMap, symbol);
     if (samplePath) {
         /* Build the absolute .wav path to use as cache key */

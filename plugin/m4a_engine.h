@@ -41,6 +41,19 @@ extern "C" {
 #define VOICE_TYPE_CGB_MASK         0x07
 #define VOICE_TYPE_FIX              0x08
 
+/* Golden Sun synth instruments (ipatix improved-mixer feature).
+ * A DirectSound sample whose WaveData.size is 0 is not PCM data but a
+ * synthesized-tone descriptor: data[1] selects the waveform (0 = pulse,
+ * 1 = pseudo sawtooth, anything else = triangle) and, for the pulse wave,
+ * data[2] = base duty cycle, data[3] = duty LFO step per frame,
+ * data[4] = modulation amount, data[5] = duty LFO phase offset.
+ * These values classify a PCM channel; 0 means "normal sample playback"
+ * so zero-initialized channels are never misread as synths. */
+#define M4A_SYNTH_NONE      0
+#define M4A_SYNTH_PULSE     1
+#define M4A_SYNTH_SAW       2
+#define M4A_SYNTH_TRIANGLE  3
+
 /* Channel status flags (matching GBA) */
 #define CHN_START       0x80
 #define CHN_STOP        0x40
@@ -176,6 +189,13 @@ typedef struct {
     bool isLoop;
     int32_t loopLen;        /* loop length in samples */
     int8_t *loopStart;      /* pointer to loop start in sample data */
+
+    /* Golden Sun synth voice (M4A_SYNTH_*; M4A_SYNTH_NONE = normal sample).
+     * When active, the channel reuses fw as the 32-bit oscillator phase (one
+     * wave period = 2^32) and count as the pulse duty LFO accumulator / saw
+     * filter state, exactly like the GBA improved mixer reuses those fields. */
+    uint8_t synthType;
+    uint32_t synthPulseDuty; /* pulse: phase threshold; recomputed every tick */
 } M4APCMChannel;
 
 /* CGB Channel (square, noise, programmable wave) */

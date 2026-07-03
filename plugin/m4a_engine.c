@@ -744,6 +744,7 @@ void m4a_engine_note_on(M4AEngine *engine, int trackIndex, uint8_t key, uint8_t 
                 ch->currentPointer = prev->currentPointer;
                 ch->count = prev->count;
                 ch->fw = prev->fw;
+                ch->synthPulseDuty = prev->synthPulseDuty;
                 uint8_t prevVolume = prev->envelopeVolume;
                 ch->envelopeVolume = (prevVolume > ch->sustain) ? prevVolume : ch->sustain;
                 ch->status = CHN_ENV_SUSTAIN | (prev->status & CHN_LOOP);

@@ -288,6 +288,15 @@ The loader auto-discovers and parses project assembly source files at runtime:
 
 Keysplit and drumset sub-voicegroups are resolved recursively across all discovered voicegroup directories. Additional search paths can be configured for projects with non-standard layouts.
 
+### Golden Sun synth instruments
+
+Poryaaaa supports the synthesized instruments from Golden Sun's custom mixer, as featured in [ipatix's improved ("HQ") mixer](https://github.com/ipatix/gba-hq-mixer): pulse wave (with duty-cycle modulation), pseudo-sawtooth, and triangle. A DirectSound voice whose sample has a length of zero is played as one of these synth tones instead of PCM data. Support is always enabled — projects without synth samples are unaffected.
+
+Both ways of defining synth voices are recognized:
+
+- **Binary samples**: a `.bin` sample with size 0 whose data bytes select the waveform and pulse parameters, referenced from `direct_sound_data.inc` like any other sample.
+- **Assembly macros**: inline `set_synth_pulse p1, p2, p3, p4`, `set_synth_saw`, and `set_synth_triangle` definitions, auto-discovered from `sound/direct_sound_synth_data.inc`. The alias names `set_synth_custom`, `set_synth_25`, and `set_synth_50` are also accepted.
+
 ## GBA source reference
 
 The engine reimplements algorithms from these pokeemerald source files:
