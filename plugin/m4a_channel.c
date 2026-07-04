@@ -11,42 +11,64 @@
  * Matches the SoundMainRAM mixer in m4a_1.s
  */
 
+/*
+ * Advance the pulse synth's duty-cycle LFO one frame and recompute the phase
+ * threshold the oscillator is compared against.  Matches the pulse path of
+ * C_setup_synth in the improved mixer, which runs once per mixing frame:
+ * count (the GBA reuses the sample countdown field) accumulates the LFO step,
+ * the offset value is folded into a triangle wave with a bitwise NOT when
+ * negative, and the result scaled by the mod amount plus the base duty gives
+ * the threshold.  All arithmetic wraps at 32 bits like the ARM code.
+ */
+static void m4a_pcm_synth_pulse_update(M4APCMChannel *ch)
+{
+    const uint8_t *cfg = (const uint8_t *)ch->wav->data;
+    uint32_t lfo = (uint32_t)ch->count + ((uint32_t)cfg[3] << 24);
+    ch->count = (int32_t)lfo;
+    uint32_t folded = lfo + ((uint32_t)cfg[5] << 24);
+    if ((int32_t)folded < 0)
+        folded = ~folded;
+    ch->synthPulseDuty = ((uint32_t)cfg[2] << 24) + (folded >> 8) * cfg[4];
+}
+
 void m4a_pcm_channel_start(M4APCMChannel *ch, WaveData *wav, uint8_t type)
 {
     ch->wav = wav;
     ch->type = type;
     ch->envelopeVolume = 0;
 
-    if (wav->size == 0) {
-        /* Synth voice: no sample data, phase accumulator drives the oscillator.
-         * Triangle (type 2) starts at quarter-cycle (0x40000000) to avoid pop. */
-        uint8_t synthType = ((uint8_t *)wav->data)[1];
-        ch->currentPointer = NULL;
-        ch->count = 0;  /* saw: IIR state; pulse: PWM pos accumulator */
-        ch->isLoop = false;
-        ch->loopLen = 0;
-        ch->loopStart = NULL;
-        ch->fw = (synthType == 2) ? 0x40000000 : 0;
-    } else if (type == VOICE_CRY_REVERSE) {
-        ch->currentPointer = wav->data + wav->size - 1;
-        ch->count = wav->size;
-        ch->fw = 0;
-        ch->isLoop = false;
-        ch->loopLen = 0;
-        ch->loopStart = NULL;
-    } else {
-        ch->currentPointer = wav->data;
-        ch->count = wav->size;
-        ch->fw = 0;
+    /* Golden Sun synth voice: a zero-length sample is a synthesized-tone
+     * descriptor, not PCM data.  Matches C_channel_init_synth in the improved
+     * SoundMainRAM mixer. */
+    ch->synthType = M4A_SYNTH_NONE;
+    if (wav->size == 0 && wav->data) {
+        uint8_t waveType = (uint8_t)wav->data[1];
+        if (waveType == 0)
+            ch->synthType = M4A_SYNTH_PULSE;
+        else if (waveType == 1)
+            ch->synthType = M4A_SYNTH_SAW;
+        else
+            ch->synthType = M4A_SYNTH_TRIANGLE;
+        /* The triangle wave starts at 90 degrees phase so the note begins at
+         * the zero crossing instead of the negative peak (avoids a pop).  The
+         * GBA mixer only does this for the exact descriptor value 2. */
+        if (waveType == 2)
+            ch->fw = 0x40000000u;
+        /* Prime the duty threshold so the note doesn't render against a
+         * zero threshold before the first engine tick (on the GBA the frame
+         * that initializes the channel also runs C_setup_synth). */
+        if (ch->synthType == M4A_SYNTH_PULSE)
+            m4a_pcm_synth_pulse_update(ch);
+    }
 
-        ch->isLoop = (wav->status & 0xC000) != 0;
-        if (ch->isLoop) {
-            ch->loopStart = wav->data + wav->loopStart;
-            ch->loopLen = wav->size - wav->loopStart;
-            if (ch->loopLen <= 0) {
-                ch->isLoop = false;
-                ch->loopLen = 0;
-            }
+    /* Check for loop - GBA checks wav->status bits 14-15 (0xC000) */
+    ch->isLoop = (wav->status & 0xC000) != 0;
+    if (ch->isLoop) {
+        ch->loopStart = wav->data + wav->loopStart;
+        ch->loopLen = wav->size - wav->loopStart;
+        if (ch->loopLen <= 0) {
+            ch->isLoop = false;
+            ch->loopLen = 0;
         }
     }
 
@@ -94,9 +116,11 @@ void m4a_pcm_channel_tick(M4APCMChannel *ch, uint8_t masterVolume)
     }
 
     if (ch->status & CHN_IEC) {
-        /* Pseudo-echo countdown */
+        /* Pseudo-echo countdown.  Signed check matches the GBA's subs/bhi:
+         * a starting length of 0 underflows and must stop the channel
+         * immediately rather than wrapping to 255. */
         ch->pseudoEchoLength--;
-        if (ch->pseudoEchoLength == 0) {
+        if ((int8_t)ch->pseudoEchoLength <= 0) {
             ch->status = 0;
             return;
         }
@@ -150,6 +174,11 @@ void m4a_pcm_channel_tick(M4APCMChannel *ch, uint8_t masterVolume)
     uint32_t vol = ((uint32_t)(masterVolume + 1) * envVol) >> 4;
     ch->envelopeVolumeRight = ((uint32_t)ch->rightVolume * vol) >> 8;
     ch->envelopeVolumeLeft = ((uint32_t)ch->leftVolume * vol) >> 8;
+
+    /* Golden Sun pulse synth: the duty-cycle LFO advances once per frame,
+     * mirroring C_setup_synth running once per SoundMainRAM call. */
+    if (ch->synthType == M4A_SYNTH_PULSE && ch->wav)
+        m4a_pcm_synth_pulse_update(ch);
 }
 
 /*
@@ -166,67 +195,52 @@ void m4a_pcm_channel_render(M4APCMChannel *ch, int32_t *mixL, int32_t *mixR)
     if (!(ch->status & CHN_ON) || (ch->status & CHN_START))
         return;
 
-    /* Synth voice: wav->size == 0 means software oscillator, not sample data.
-     * Params: data[1]=type, data[2]=baseDuty, data[3]=widthChange1,
-     *         data[4]=modAmount, data[5]=widthChange2.
-     * Phase accumulator uses the full 32-bit fw; advances by frequency<<3 per
-     * output sample (matches C_setup_synth's r4 = freq*VAR_DEF_PITCH_FAC,
-     * per-sample advance r4<<3). */
-    if (ch->wav->size == 0) {
-        const uint8_t *p = (const uint8_t *)ch->wav->data;
-        uint8_t synthType = p[1];
-        uint32_t phase    = ch->fw;
-        uint32_t step     = ch->frequency << 3;
-        int32_t  sample;
-
-        switch (synthType) {
-        case 0: {  /* Pulse wave (C_synth_pulse_loop) — modulated duty cycle.
-                    * ch->count holds the PWM pos accumulator (advanced each VBlank tick).
-                    * calcThresh maps pos to a 32-bit duty threshold (matches agbplay). */
-            uint32_t pos = (uint32_t)ch->count;
-            uint32_t iThreshold = ((uint32_t)p[5] << 24) + pos;
-            if ((int32_t)iThreshold < 0)
-                iThreshold = ~iThreshold >> 8;
+    /* Golden Sun synth voices generate their tone instead of reading sample
+     * data.  fw is the 32-bit oscillator phase (one wave period = 2^32),
+     * advanced by frequency << 3 per output sample -- the pitch of a
+     * 64-sample looped wave at the descriptor's header frequency.  Matches
+     * the C_synth_* loops in the improved SoundMainRAM mixer.
+     *
+     * The "value" amplitudes below are expressed relative to a normal
+     * sample's -128..127 range.  Careful when reading the assembly: the
+     * improved mixer's normal path accumulates samples at DOUBLE scale (its
+     * interpolation computes `base << 1` + `diff * frac >> 22`) against the
+     * halved 0-127 volume, while the synth loops use their raw values with
+     * the unhalved (pulse, triangle) or halved (saw) volume.  Folding that in
+     * gives equivalent amplitudes of +/-64 (pulse), ~+/-112 (saw, after its
+     * filter's DC gain of 2), and +/-128 (triangle) -- confirmed against
+     * agbplay, ipatix's reference player, which mixes these synths at 0.5 /
+     * ~0.875 / 1.0 of full scale respectively. */
+    if (ch->synthType != M4A_SYNTH_NONE) {
+        uint32_t phase = ch->fw;
+        int32_t value;
+        if (ch->synthType == M4A_SYNTH_PULSE) {
+            /* Compared against the duty threshold before the phase advances.
+             * GBA: +/-(vol << 6) at unhalved volume = equivalent +/-64. */
+            value = (phase < ch->synthPulseDuty) ? 64 : -64;
+            phase += ch->frequency << 3;
+        } else if (ch->synthType == M4A_SYNTH_SAW) {
+            /* Pseudo sawtooth: two rising ramps with a jump at mid-period,
+             * smoothed by a one-pole filter (y = x + y/2) kept in count at
+             * full precision.  The GBA mixes the filter state at halved
+             * volume; applied here as a final halving of the value. */
+            phase += ch->frequency << 3;
+            int32_t raw = (int32_t)(phase >> 24) - 0x70
+                        - (int32_t)((phase << 1) >> 27);
+            ch->count = raw + (ch->count >> 1);
+            value = ch->count >> 1;
+        } else {
+            /* Triangle ramping -128..+128 at unhalved volume = equivalent
+             * +/-128, i.e. exactly a full-scale sample. */
+            phase += ch->frequency << 3;
+            if ((int32_t)phase < 0)
+                value = 0x180 - (int32_t)(phase >> 23);
             else
-                iThreshold = iThreshold >> 8;
-            iThreshold = iThreshold * (uint32_t)p[4] + ((uint32_t)p[2] << 24);
-            sample = (phase < iThreshold) ? 64 : -64;
-            phase += step;
-            break;
+                value = (int32_t)(phase >> 23) - 0x80;
         }
-        case 1: {  /* Saw wave (C_synth_saw_loop) — leaky integrator approximation.
-                    * ch->count holds the IIR state (r2 in assembly). Volume is
-                    * halved in the GBA (r11 lsr#1), reproduced here via >>9.
-                    * GBA: mov r6, r7, lsl#1; sub r9, r9, r6, lsr#27
-                    * (phase<<1 in 32-bit differs from phase>>26 when phase>=0x80000000) */
-            phase += step;
-            int32_t r9    = (int32_t)(phase >> 24) - 0x70 - (int32_t)((phase << 1) >> 27);
-            int32_t state = (int32_t)ch->count;
-            state = r9 + (state >> 1);
-            ch->count = state;
-            sample = state;
-            *mixR += (sample * ch->envelopeVolumeRight) >> 9;
-            *mixL += (sample * ch->envelopeVolumeLeft)  >> 9;
-            ch->fw = phase;
-            return;
-        }
-        case 2: {  /* Triangle wave (C_synth_triangle_loop) */
-            phase += step;
-            if ((phase & 0x80000000) == 0)
-                sample = (int32_t)(phase >> 23) - 128;      /* ascending: -128..127 */
-            else
-                sample = 384 - (int32_t)(phase >> 23);      /* descending: 128..-127 */
-            break;
-        }
-        default:
-            sample = 0;
-            phase += step;
-            break;
-        }
-
         ch->fw = phase;
-        *mixR += (sample * ch->envelopeVolumeRight) >> 8;
-        *mixL += (sample * ch->envelopeVolumeLeft)  >> 8;
+        *mixR += (value * ch->envelopeVolumeRight) >> 8;
+        *mixL += (value * ch->envelopeVolumeLeft) >> 8;
         return;
     }
 
@@ -293,6 +307,12 @@ void m4a_cgb_channel_start(M4ACGBChannel *ch)
     ch->status = CHN_ENV_ATTACK;
     ch->modify = 0x03; /* pitch + vol */
     ch->phase = 0;
+
+    /* Invalidate the cached phase increment / wave DC sum so the first
+     * rendered sample of this note recomputes them from the current
+     * frequency and wave table. */
+    ch->phaseIncFreq = 0xFFFFFFFFu;
+    ch->waveSumPointer = NULL;
     ch->envelopeCounter = ch->attack;
     if (ch->attack == 0) {
         /* Skip attack if instantaneous */
@@ -389,6 +409,13 @@ void m4a_cgb_channel_tick(M4ACGBChannel *ch, uint8_t c15)
     if (!(ch->status & CHN_ON))
         return;
 
+    /* Declared before the goto targets below: the start and release-start
+     * paths jump into the envelope block, and must see initialized values so
+     * they still honor the every-15th-frame double step (CgbSound initializes
+     * prevC15 before any of the equivalent branches). */
+    int doubleStep = (c15 == 0) ? 1 : 0;
+    int steps = 0;
+
     if (ch->status & CHN_START) {
         if (ch->status & CHN_STOP) {
             if (ch->type == 3)
@@ -441,9 +468,6 @@ void m4a_cgb_channel_tick(M4ACGBChannel *ch, uint8_t c15)
     }
 
     {
-        int doubleStep = (c15 == 0) ? 1 : 0;
-        int steps = 0;
-
 step_repeat:
         if (ch->envelopeCounter == 0) {
             m4a_cgb_mod_vol(ch);
@@ -554,12 +578,17 @@ void m4a_cgb_channel_render(M4ACGBChannel *ch, int32_t *mixL, int32_t *mixR,
          * CGB frequency register value is used to compute the actual frequency.
          * The CGB freq register value = 2048 - (131072 / freq_hz).
          * So freq_hz = 131072 / (2048 - reg_value).
-         * We convert to a phase increment for our 32-bit accumulator. */
-        int32_t freqReg = ch->frequency;
-        if (freqReg >= 2048) freqReg = 2047;
-        float freqHz = 131072.0f / (float)(2048 - freqReg);
-        uint32_t phaseInc = (uint32_t)(freqHz / sampleRate * 4294967296.0f);
-        ch->phase += phaseInc;
+         * We convert to a phase increment for our 32-bit accumulator.  The
+         * increment is constant between (tick-rate) frequency changes, so it is
+         * cached and only recomputed when ch->frequency changes. */
+        if (ch->frequency != ch->phaseIncFreq) {
+            int32_t freqReg = ch->frequency;
+            if (freqReg >= 2048) freqReg = 2047;
+            float freqHz = 131072.0f / (float)(2048 - freqReg);
+            ch->phaseInc = (uint32_t)(freqHz / sampleRate * 4294967296.0f);
+            ch->phaseIncFreq = ch->frequency;
+        }
+        ch->phase += ch->phaseInc;
     } else if (cgbType == 3) {
         /* Programmable wave channel */
         if (ch->wavePointer) {
@@ -571,14 +600,21 @@ void m4a_cgb_channel_render(M4ACGBChannel *ch, int32_t *mixL, int32_t *mixR,
                 nibble = waveData[pos >> 1] & 0x0F;
             else
                 nibble = (waveData[pos >> 1] >> 4) & 0x0F;
-            /* Compute the sum of all 32 raw nibbles for DC offset removal.
-             * The wave mean varies per waveform, so using a fixed midpoint
-             * of 8 leaves a DC offset that causes clicks at note start/end. */
-            int32_t waveSum = 0;
-            for (int i = 0; i < 16; i++) {
-                waveSum += (waveData[i] >> 4) & 0x0F;
-                waveSum += waveData[i] & 0x0F;
+            /* Sum of all 32 raw nibbles for DC offset removal.  The wave mean
+             * varies per waveform, so using a fixed midpoint of 8 leaves a DC
+             * offset that causes clicks at note start/end.  The sum depends
+             * only on the wave table contents, so it is cached and recomputed
+             * only when wavePointer changes. */
+            if (ch->wavePointer != ch->waveSumPointer) {
+                int32_t waveSum = 0;
+                for (int i = 0; i < 16; i++) {
+                    waveSum += (waveData[i] >> 4) & 0x0F;
+                    waveSum += waveData[i] & 0x0F;
+                }
+                ch->waveSum = waveSum;
+                ch->waveSumPointer = ch->wavePointer;
             }
+            int32_t waveSum = ch->waveSum;
 
             /* Volume control: apply shift to raw 4-bit nibble to match
              * GBA hardware quantization (NR32 register).
@@ -586,7 +622,10 @@ void m4a_cgb_channel_render(M4ACGBChannel *ch, int32_t *mixL, int32_t *mixR,
              * 4-bit value, creating quantized "plateaus" in the output.
              * Apply the same volume logic to the mean for accurate DC removal. */
             int32_t shifted = (int32_t)nibble;
-            int nr32 = gCgb3Vol[ch->envelopeVolume];
+            /* envelopeVolume can exceed 15 (CgbModVol's center-pan goal is
+             * unclamped, up to 31); hardware truncates on the register write,
+             * so only the low 4 bits are audible. */
+            int nr32 = gCgb3Vol[ch->envelopeVolume & 0x0F];
             int32_t meanShifted;
             if (nr32 == 0) {
                 shifted = 0;
@@ -603,14 +642,17 @@ void m4a_cgb_channel_render(M4ACGBChannel *ch, int32_t *mixL, int32_t *mixR,
             /* Center around the waveform's actual mean to remove DC offset */
             sample = (shifted - meanShifted) * 8;
 
-            /* Advance phase */
-            int32_t freqReg = ch->frequency;
-            if (freqReg >= 2048) freqReg = 2047;
-            float freqHz = 2097152.0f / (float)(2048 - freqReg);
-            /* Wave channel plays 32 samples per period */
-            freqHz /= 32.0f;
-            uint32_t phaseInc = (uint32_t)(freqHz / sampleRate * 4294967296.0f);
-            ch->phase += phaseInc;
+            /* Advance phase (cached; recomputed only on frequency change). */
+            if (ch->frequency != ch->phaseIncFreq) {
+                int32_t freqReg = ch->frequency;
+                if (freqReg >= 2048) freqReg = 2047;
+                float freqHz = 2097152.0f / (float)(2048 - freqReg);
+                /* Wave channel plays 32 samples per period */
+                freqHz /= 32.0f;
+                ch->phaseInc = (uint32_t)(freqHz / sampleRate * 4294967296.0f);
+                ch->phaseIncFreq = ch->frequency;
+            }
+            ch->phase += ch->phaseInc;
         }
     } else if (cgbType == 4) {
         /* Noise channel using LFSR */
@@ -618,17 +660,22 @@ void m4a_cgb_channel_render(M4ACGBChannel *ch, int32_t *mixL, int32_t *mixR,
 
         /* Advance LFSR at noise frequency rate */
         uint8_t noiseParams = ch->frequency & 0xFF;
-        uint8_t divRatio = noiseParams & 0x07;
-        uint8_t shiftFreq = (noiseParams >> 4) & 0x0F;
-        /* bool shortMode = (noiseParams >> 3) & 1; */
 
-        float baseFreq = 524288.0f;
-        float divisor = (divRatio == 0) ? 0.5f : (float)divRatio;
-        float noiseFreq = baseFreq / divisor / (float)(1 << (shiftFreq + 1));
+        /* Phase increment is constant between frequency changes; cache it. */
+        if (ch->frequency != ch->phaseIncFreq) {
+            uint8_t divRatio = noiseParams & 0x07;
+            uint8_t shiftFreq = (noiseParams >> 4) & 0x0F;
+            /* bool shortMode = (noiseParams >> 3) & 1; */
 
-        uint32_t phaseInc = (uint32_t)(noiseFreq / sampleRate * 4294967296.0f);
+            float baseFreq = 524288.0f;
+            float divisor = (divRatio == 0) ? 0.5f : (float)divRatio;
+            float noiseFreq = baseFreq / divisor / (float)(1 << (shiftFreq + 1));
+
+            ch->phaseInc = (uint32_t)(noiseFreq / sampleRate * 4294967296.0f);
+            ch->phaseIncFreq = ch->frequency;
+        }
         uint32_t oldPhase = ch->phase;
-        ch->phase += phaseInc;
+        ch->phase += ch->phaseInc;
 
         /* Clock LFSR on phase wrap.
          * Bit 3 of frequency = period mode: 0 = 15-bit LFSR, 1 = 7-bit LFSR. */
@@ -645,7 +692,10 @@ void m4a_cgb_channel_render(M4ACGBChannel *ch, int32_t *mixL, int32_t *mixR,
      * envelopeVolume is the 4-bit GBA hardware volume (0-15), matching what
      * CgbSound writes to NR12/NR22/NR42. */
     if (cgbType != 3) {
-        sample = (sample * ch->envelopeVolume) >> 4;
+        /* Mask to 4 bits: envelopeVolume can reach 31 (unclamped center-pan
+         * goal), but the NRx2 write is (envelopeVolume << 4) truncated to a
+         * byte, so hardware plays envelopeVolume & 0xF. */
+        sample = (sample * (ch->envelopeVolume & 0x0F)) >> 4;
     }
 
     /* Scale CGB to match the GBA hardware mixing ratio.

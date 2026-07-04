@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <clap/clap.h>
 #include "m4a_engine.h"
+#include "voicegroup_loader.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -12,6 +13,7 @@ extern "C" {
 
 /* Opaque GUI state handle */
 typedef struct M4AGuiState M4AGuiState;
+typedef void (*M4AGuiTimerCallback)(void *user_data);
 
 /* Settings shown/edited in the GUI */
 typedef struct {
@@ -22,6 +24,15 @@ typedef struct {
     uint8_t songMasterVolume;
     bool analogFilter;
     uint8_t maxPcmChannels;
+    /* DirectSound PCM mix rate in Hz (0 = follow host rate; 13379 = GBA). */
+    float pcmMixRate;
+    /* Opt-in effect feature toggles (Options menu) */
+    bool respectBaseMidiKey;
+    bool portamentoEnabled;
+    bool pwmEnabled;
+    /* Polyphony debug: mute normal audio, play only overflow-lost sounds.
+     * Session-only -- deliberately not persisted in config or CLAP state. */
+    bool polyDebugInvert;
     bool voicegroupLoaded;
 } M4AGuiSettings;
 
@@ -66,6 +77,26 @@ bool m4a_gui_set_parent(M4AGuiState *gui, uintptr_t native_parent);
 void m4a_gui_tick(M4AGuiState *gui);
 
 /*
+ * Set a callback that the internal GUI timer should invoke on the main thread.
+ * When set, the internal Pugl timer uses this instead of calling m4a_gui_tick()
+ * directly so the plugin can reuse its normal timer pump.
+ */
+void m4a_gui_set_internal_timer_callback(M4AGuiState *gui,
+                                          M4AGuiTimerCallback callback,
+                                          void *user_data);
+
+/*
+ * Start an internal Pugl timer to drive rendering at ~60 Hz.
+ * Use this when the CLAP host does not provide timer_support.
+ */
+void m4a_gui_start_internal_timer(M4AGuiState *gui);
+
+/*
+ * Stop the internal Pugl timer if it is active.
+ */
+void m4a_gui_stop_internal_timer(M4AGuiState *gui);
+
+/*
  * Returns true if the GUI window has been closed by the user.
  */
 bool m4a_gui_was_closed(M4AGuiState *gui);
@@ -84,19 +115,38 @@ void m4a_gui_update_settings(M4AGuiState *gui, const M4AGuiSettings *settings);
 bool m4a_gui_poll_changes(M4AGuiState *gui, M4AGuiSettings *out, bool *reload_voicegroup);
 
 /*
- * Provide the GUI with direct pointers to voice data for the voice editor tab.
- * Pass NULL for all pointers to clear (e.g. when voicegroup is unloaded).
+ * Provide the GUI with direct pointers to voice data for the voice editor tab
+ * and per-voice display names (from LoadedVoiceGroup.voiceNames) for the
+ * polyphony monitor.  Pass NULL for all pointers to clear (e.g. when the
+ * voicegroup is unloaded).
  */
 void m4a_gui_set_voice_data(M4AGuiState *gui,
                              ToneData *liveVoices,
                              const ToneData *originalVoices,
-                             bool *overrides);
+                             bool *overrides,
+                             const char (*voiceNames)[VG_VOICE_NAME_LEN]);
+
+/*
+ * Give the GUI a read-only view of the engine for the realtime polyphony
+ * monitor (channel usage, overflow counters/events).  The engine struct is
+ * owned by the plugin and outlives the GUI; the audio thread writes it while
+ * the GUI reads it without locking, which is benign for monitoring (all the
+ * fields read are small scalars).  Pass NULL to detach.
+ */
+void m4a_gui_set_engine(M4AGuiState *gui, M4AEngine *engine);
 
 /*
  * Poll for a voice restore request. Returns true if the user clicked
  * "Restore Original" on a voice. *voiceIndex receives the voice index.
  */
 bool m4a_gui_poll_voice_restore(M4AGuiState *gui, int *voiceIndex);
+
+/*
+ * Returns true (and clears) if the user clicked "Reset Counters" on the
+ * Polyphony tab.  The plugin should call m4a_engine_reset_poly_stats().
+ * Keeps the GUI's engine access strictly read-only.
+ */
+bool m4a_gui_poll_poly_reset(M4AGuiState *gui);
 
 /*
  * Returns true (and clears) if any voice was edited since the last poll.

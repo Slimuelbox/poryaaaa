@@ -120,6 +120,17 @@ static void load_config_file(M4APluginData *data)
             data->songMasterVolume = (uint8_t)v;
         } else if (strcmp(key, "analog_filter") == 0) {
             data->analogFilter = (atoi(value) != 0);
+        } else if (strcmp(key, "respect_base_midi_key") == 0) {
+            data->respectBaseMidiKey = (atoi(value) != 0);
+        } else if (strcmp(key, "portamento") == 0) {
+            data->portamentoEnabled = (atoi(value) != 0);
+        } else if (strcmp(key, "pwm") == 0) {
+            data->pwmEnabled = (atoi(value) != 0);
+        } else if (strcmp(key, "pcm_mix_rate") == 0) {
+            /* DirectSound mix rate in Hz; 0 = follow host rate. */
+            float v = (float)atof(value);
+            if (v < 0.0f) v = 0.0f;
+            data->pcmMixRate = v;
         } else if (strcmp(key, "max_channels") == 0) {
             int v = atoi(value);
             if (v < 1) v = 1;
@@ -178,6 +189,12 @@ static bool plugin_init(const clap_plugin_t *plugin)
     data->reverbAmount = 0;
     data->analogFilter = false;
     data->maxPcmChannels = 5;
+    data->respectBaseMidiKey = false;
+    data->portamentoEnabled = false;
+    data->pwmEnabled = false;
+    data->polyDebugInvert = false;
+    data->pcmMixRate = 13379.0f; /* GBA-accurate DirectSound mix rate by default */
+    data->transportWasPlaying = false;
     data->projectRoot[0] = '\0';
     data->voicegroupName[0] = '\0';
     data->loadedVg = NULL;
@@ -213,6 +230,13 @@ static bool plugin_activate(const clap_plugin_t *plugin, double sample_rate,
     data->engine.songMasterVolume = data->songMasterVolume;
     data->engine.analogFilter = data->analogFilter;
     data->engine.maxPcmChannels = data->maxPcmChannels;
+    data->engine.respectBaseMidiKey = data->respectBaseMidiKey;
+    m4a_engine_set_portamento_enabled(&data->engine, data->portamentoEnabled);
+    m4a_engine_set_pwm_enabled(&data->engine, data->pwmEnabled);
+    m4a_engine_set_poly_debug_invert(&data->engine, data->polyDebugInvert);
+    /* Apply the configured mix rate before setting the reverb amount, since it
+     * rebuilds the reverb delay line for the new rate. */
+    m4a_engine_set_pcm_mix_rate(&data->engine, data->pcmMixRate);
     m4a_reverb_set_amount(&data->engine.reverb, data->reverbAmount);
 
     /* If voicegroup is configured, load it */
@@ -235,9 +259,9 @@ static bool plugin_activate(const clap_plugin_t *plugin, double sample_rate,
     /* Update voice data pointers for the GUI */
     if (data->gui) {
         if (data->loadedVg)
-            m4a_gui_set_voice_data(data->gui, data->loadedVg->voices, data->originalVoices, data->voiceOverrides);
+            m4a_gui_set_voice_data(data->gui, data->loadedVg->voices, data->originalVoices, data->voiceOverrides, data->loadedVg->voiceNames);
         else
-            m4a_gui_set_voice_data(data->gui, NULL, NULL, NULL);
+            m4a_gui_set_voice_data(data->gui, NULL, NULL, NULL, NULL);
     }
 
     /* Notify GUI of current voicegroup status */
@@ -251,6 +275,11 @@ static bool plugin_activate(const clap_plugin_t *plugin, double sample_rate,
         gs.songMasterVolume  = data->songMasterVolume;
         gs.analogFilter      = data->analogFilter;
         gs.maxPcmChannels    = data->maxPcmChannels;
+        gs.pcmMixRate        = data->pcmMixRate;
+        gs.respectBaseMidiKey = data->respectBaseMidiKey;
+        gs.portamentoEnabled = data->portamentoEnabled;
+        gs.pwmEnabled        = data->pwmEnabled;
+        gs.polyDebugInvert   = data->polyDebugInvert;
         gs.voicegroupLoaded  = (data->loadedVg != NULL);
         m4a_gui_update_settings(data->gui, &gs);
     }
@@ -262,7 +291,7 @@ static void plugin_deactivate(const clap_plugin_t *plugin)
 {
     M4APluginData *data = (M4APluginData *)plugin->plugin_data;
     if (data->gui)
-        m4a_gui_set_voice_data(data->gui, NULL, NULL, NULL);
+        m4a_gui_set_voice_data(data->gui, NULL, NULL, NULL, NULL);
     m4a_engine_destroy(&data->engine);
     data->activated = false;
 }
@@ -354,6 +383,17 @@ static clap_process_status plugin_process(const clap_plugin_t *plugin,
     if (process->transport
         && (process->transport->flags & CLAP_TRANSPORT_HAS_TEMPO)) {
         m4a_engine_set_tempo_bpm(&data->engine, process->transport->tempo);
+    }
+
+    /* When the host transport stops, forget portamento note history so the
+     * first note after the playhead moves doesn't glide from a note that was
+     * sounding when playback paused.  (Hosts that send All Notes Off / All
+     * Sound Off on stop are covered by those handlers too.) */
+    if (process->transport) {
+        bool playing = (process->transport->flags & CLAP_TRANSPORT_IS_PLAYING) != 0;
+        if (data->transportWasPlaying && !playing)
+            m4a_engine_reset_portamento(&data->engine);
+        data->transportWasPlaying = playing;
     }
 
     const uint32_t numFrames = process->frames_count;
@@ -479,6 +519,16 @@ static bool state_save(const clap_plugin_t *plugin, const clap_ostream_t *stream
     uint8_t analogFilterByte = data->analogFilter ? 1 : 0;
     if (stream->write(stream, &analogFilterByte, 1) != 1) return false;
     if (stream->write(stream, &data->maxPcmChannels, 1) != 1) return false;
+    /* Opt-in feature flags (appended after maxPcmChannels for back-compat) */
+    uint8_t baseKeyByte    = data->respectBaseMidiKey ? 1 : 0;
+    uint8_t portamentoByte = data->portamentoEnabled  ? 1 : 0;
+    uint8_t pwmByte        = data->pwmEnabled         ? 1 : 0;
+    if (stream->write(stream, &baseKeyByte, 1) != 1) return false;
+    if (stream->write(stream, &portamentoByte, 1) != 1) return false;
+    if (stream->write(stream, &pwmByte, 1) != 1) return false;
+    /* PCM mix rate (float, appended for back-compat with older saves) */
+    float pcmMixRate = data->pcmMixRate;
+    if (stream->write(stream, &pcmMixRate, sizeof(pcmMixRate)) != sizeof(pcmMixRate)) return false;
 
     return true;
 }
@@ -518,6 +568,21 @@ static bool state_load(const clap_plugin_t *plugin, const clap_istream_t *stream
     if (maxChannelsByte < 1) maxChannelsByte = 1;
     if (maxChannelsByte > MAX_PCM_CHANNELS) maxChannelsByte = MAX_PCM_CHANNELS;
     data->maxPcmChannels = maxChannelsByte;
+    /* Opt-in feature flags are optional (absent in older saves); default off. */
+    uint8_t baseKeyByte = 0, portamentoByte = 0, pwmByte = 0;
+    stream->read(stream, &baseKeyByte, 1);
+    stream->read(stream, &portamentoByte, 1);
+    stream->read(stream, &pwmByte, 1);
+    data->respectBaseMidiKey = (baseKeyByte != 0);
+    data->portamentoEnabled  = (portamentoByte != 0);
+    data->pwmEnabled         = (pwmByte != 0);
+    /* PCM mix rate is optional (absent in older saves); default to GBA-accurate.
+     * On a short/partial read, discard whatever was written and keep the default. */
+    float pcmMixRate = 13379.0f;
+    if (stream->read(stream, &pcmMixRate, sizeof(pcmMixRate)) != (int64_t)sizeof(pcmMixRate))
+        pcmMixRate = 13379.0f;
+    if (pcmMixRate < 0.0f) pcmMixRate = 0.0f;
+    data->pcmMixRate = pcmMixRate;
 
     if (data->activated) {
         /* Only reload voicegroup if the project root or name actually changed */
@@ -540,6 +605,10 @@ static bool state_load(const clap_plugin_t *plugin, const clap_istream_t *stream
         data->engine.songMasterVolume = data->songMasterVolume;
         data->engine.analogFilter = data->analogFilter;
         data->engine.maxPcmChannels = data->maxPcmChannels;
+        data->engine.respectBaseMidiKey = data->respectBaseMidiKey;
+        m4a_engine_set_portamento_enabled(&data->engine, data->portamentoEnabled);
+        m4a_engine_set_pwm_enabled(&data->engine, data->pwmEnabled);
+        m4a_engine_set_pcm_mix_rate(&data->engine, data->pcmMixRate);
         m4a_reverb_set_amount(&data->engine.reverb, data->reverbAmount);
     }
 
@@ -549,17 +618,22 @@ static bool state_load(const clap_plugin_t *plugin, const clap_istream_t *stream
         memset(&gs, 0, sizeof(gs));
         snprintf(gs.projectRoot,    sizeof(gs.projectRoot),    "%s", data->projectRoot);
         snprintf(gs.voicegroupName, sizeof(gs.voicegroupName), "%s", data->voicegroupName);
+        gs.respectBaseMidiKey = data->respectBaseMidiKey;
+        gs.portamentoEnabled  = data->portamentoEnabled;
+        gs.pwmEnabled         = data->pwmEnabled;
+        gs.polyDebugInvert    = data->polyDebugInvert;
         gs.reverbAmount     = data->reverbAmount;
         gs.masterVolume     = data->masterVolume;
         gs.songMasterVolume = data->songMasterVolume;
         gs.analogFilter     = data->analogFilter;
         gs.maxPcmChannels   = data->maxPcmChannels;
+        gs.pcmMixRate       = data->pcmMixRate;
         gs.voicegroupLoaded = (data->loadedVg != NULL);
         m4a_gui_update_settings(data->gui, &gs);
         if (data->loadedVg)
-            m4a_gui_set_voice_data(data->gui, data->loadedVg->voices, data->originalVoices, data->voiceOverrides);
+            m4a_gui_set_voice_data(data->gui, data->loadedVg->voices, data->originalVoices, data->voiceOverrides, data->loadedVg->voiceNames);
         else
-            m4a_gui_set_voice_data(data->gui, NULL, NULL, NULL);
+            m4a_gui_set_voice_data(data->gui, NULL, NULL, NULL, NULL);
     }
 
     return true;
@@ -583,6 +657,123 @@ static void plugin_log(const char *fmt, ...)
     va_end(ap);
     fputc('\n', f);
     fclose(f);
+}
+
+/* ---- Timer support extension ---- */
+
+static void timer_on_timer(const clap_plugin_t *plugin, clap_id timer_id)
+{
+    M4APluginData *data = (M4APluginData *)plugin->plugin_data;
+    if (!data->gui)
+        return;
+    /* If the host supports timers, only respond to our registered timer.
+     * If not (e.g. standalone without native timer support), accept any id
+     * so an external driver can call on_timer to pump the GUI. */
+    if (data->guiTimerId != CLAP_INVALID_ID && timer_id != data->guiTimerId)
+        return;
+
+    /* Render one GUI frame */
+    m4a_gui_tick(data->gui);
+
+    /* Handle voice restore requests from the voice editor */
+    int restoreIdx;
+    bool voicesChanged = false;
+    while (m4a_gui_poll_voice_restore(data->gui, &restoreIdx)) {
+        if (data->loadedVg && restoreIdx >= 0 && restoreIdx < VOICEGROUP_SIZE) {
+            data->loadedVg->voices[restoreIdx] = data->originalVoices[restoreIdx];
+            data->voiceOverrides[restoreIdx] = false;
+            voicesChanged = true;
+        }
+    }
+
+    /* If any voice was edited or restored, refresh active tracks */
+    if (m4a_gui_poll_voices_dirty(data->gui))
+        voicesChanged = true;
+    if (voicesChanged && data->activated)
+        m4a_engine_refresh_voices(&data->engine);
+
+    /* Reset polyphony-overflow statistics if the user clicked Reset.  The
+     * engine struct is embedded in M4APluginData, so this is safe even while
+     * the plugin is deactivated. */
+    if (m4a_gui_poll_poly_reset(data->gui))
+        m4a_engine_reset_poly_stats(&data->engine);
+
+    /* Apply any settings the user changed */
+    M4AGuiSettings gs;
+    bool reloadVoicegroup = false;
+    if (!m4a_gui_poll_changes(data->gui, &gs, &reloadVoicegroup))
+        return;
+
+    /* Immediate audio settings - safe to write since they're byte-sized */
+    data->reverbAmount     = gs.reverbAmount;
+    data->masterVolume     = gs.masterVolume;
+    data->songMasterVolume = gs.songMasterVolume;
+    data->analogFilter     = gs.analogFilter;
+    data->maxPcmChannels   = gs.maxPcmChannels;
+    data->respectBaseMidiKey = gs.respectBaseMidiKey;
+    data->portamentoEnabled  = gs.portamentoEnabled;
+    data->pwmEnabled         = gs.pwmEnabled;
+    data->polyDebugInvert    = gs.polyDebugInvert;
+    data->pcmMixRate         = gs.pcmMixRate;
+
+    if (data->activated) {
+        data->engine.masterVolume = gs.masterVolume;
+        m4a_engine_set_song_volume(&data->engine, gs.songMasterVolume);
+        data->engine.analogFilter = gs.analogFilter;
+        data->engine.maxPcmChannels = gs.maxPcmChannels;
+        data->engine.respectBaseMidiKey = gs.respectBaseMidiKey;
+        m4a_engine_set_portamento_enabled(&data->engine, gs.portamentoEnabled);
+        m4a_engine_set_pwm_enabled(&data->engine, gs.pwmEnabled);
+        m4a_engine_set_poly_debug_invert(&data->engine, gs.polyDebugInvert);
+        /* Rebuilds the reverb delay line for the new rate; set amount after. */
+        m4a_engine_set_pcm_mix_rate(&data->engine, gs.pcmMixRate);
+        m4a_reverb_set_amount(&data->engine.reverb, gs.reverbAmount);
+    }
+
+    if (reloadVoicegroup) {
+        /* Update paths, then ask the host to deactivate/reactivate so the new
+         * voicegroup is loaded cleanly from the audio thread's perspective. */
+        snprintf(data->projectRoot,    sizeof(data->projectRoot),
+                 "%s", gs.projectRoot);
+        snprintf(data->voicegroupName, sizeof(data->voicegroupName),
+                 "%s", gs.voicegroupName);
+        data->restartRequested = true;
+        data->host->request_restart(data->host);
+    }
+
+    /* Register this change with the host's undo stack.
+     *
+     * Prefer the CLAP undo draft extension when available: pass no delta so
+     * the host snapshots state via state->save()/state->load().
+     *
+     * Fall back to mark_dirty() for hosts (e.g. Reaper) that don't implement
+     * the draft extension. Per the CLAP spec, mark_dirty() creates an implicit
+     * undo step as long as the plugin hasn't opted into CLAP_EXT_UNDO. */
+    const clap_host_undo_t *hostUndo =
+        (const clap_host_undo_t *)data->host->get_extension(data->host, CLAP_EXT_UNDO);
+    if (hostUndo && hostUndo->change_made) {
+        const char *name = reloadVoicegroup ? "M4A: Reload Voicegroup"
+                                            : "M4A: Settings Change";
+        hostUndo->change_made(data->host, name, NULL, 0, false);
+    } else {
+        const clap_host_state_t *hostState =
+            (const clap_host_state_t *)data->host->get_extension(data->host, CLAP_EXT_STATE);
+        if (hostState && hostState->mark_dirty)
+            hostState->mark_dirty(data->host);
+    }
+
+    /* Reflect updated status back into the GUI (voicegroupLoaded may change
+     * after request_restart completes, but update the rest immediately). */
+    gs.voicegroupLoaded = (data->loadedVg != NULL);
+    m4a_gui_update_settings(data->gui, &gs);
+}
+
+static void gui_internal_timer_callback(void *user_data)
+{
+    /* The internal Pugl timer only runs when the host has no timer_support,
+     * so guiTimerId is CLAP_INVALID_ID and timer_on_timer ignores the id.
+     * The 0 passed here is therefore never compared against a real id. */
+    timer_on_timer((const clap_plugin_t *)user_data, 0);
 }
 
 static bool gui_is_api_supported(const clap_plugin_t *plugin, const char *api, bool is_floating)
@@ -638,6 +829,11 @@ static bool gui_create(const clap_plugin_t *plugin, const char *api, bool is_flo
     gs.songMasterVolume = data->songMasterVolume;
     gs.analogFilter     = data->analogFilter;
     gs.maxPcmChannels   = data->maxPcmChannels;
+    gs.pcmMixRate       = data->pcmMixRate;
+    gs.respectBaseMidiKey = data->respectBaseMidiKey;
+    gs.portamentoEnabled  = data->portamentoEnabled;
+    gs.pwmEnabled         = data->pwmEnabled;
+    gs.polyDebugInvert    = data->polyDebugInvert;
     gs.voicegroupLoaded = (data->loadedVg != NULL);
 
     data->gui = m4a_gui_create(data->host, &gs, s_pluginLogPath);
@@ -645,14 +841,23 @@ static bool gui_create(const clap_plugin_t *plugin, const char *api, bool is_flo
         plugin_log("gui_create: m4a_gui_create() returned NULL");
         return false;
     }
+    m4a_gui_set_internal_timer_callback(data->gui, gui_internal_timer_callback, (void *)plugin);
+
+    /* Read-only engine view for the realtime polyphony monitor.  The engine
+     * is embedded in M4APluginData, which outlives the GUI (CLAP destroys the
+     * GUI before the plugin), so the pointer stays valid. */
+    m4a_gui_set_engine(data->gui, &data->engine);
 
     /* Wire voice data pointers if voicegroup is already loaded */
     if (data->loadedVg)
-        m4a_gui_set_voice_data(data->gui, data->loadedVg->voices, data->originalVoices, data->voiceOverrides);
+        m4a_gui_set_voice_data(data->gui, data->loadedVg->voices, data->originalVoices, data->voiceOverrides, data->loadedVg->voiceNames);
 
     plugin_log("gui_create: success");
 
-    /* Register a ~60 Hz timer to drive GUI rendering */
+    /* Register a ~60 Hz timer to drive GUI rendering. If the host provides
+     * timer_support, it drives on_timer. Otherwise the internal Pugl timer
+     * (started in gui_show) drives it via gui_internal_timer_callback, which
+     * was already wired up above. */
     const clap_host_timer_support_t *timerExt =
         (const clap_host_timer_support_t *)data->host->get_extension(
             data->host, CLAP_EXT_TIMER_SUPPORT);
@@ -760,7 +965,15 @@ static bool gui_show(const clap_plugin_t *plugin)
 {
     plugin_log("gui_show called");
     M4APluginData *data = (M4APluginData *)plugin->plugin_data;
-    return m4a_gui_show(data->gui);
+    bool ok = m4a_gui_show(data->gui);
+
+    /* If the host doesn't provide timer_support, start Pugl's internal
+     * NSTimer to drive rendering at ~60 Hz. Must be called after
+     * gui_show (view must be realized and visible). */
+    if (ok && data->guiTimerId == CLAP_INVALID_ID)
+        m4a_gui_start_internal_timer(data->gui);
+
+    return ok;
 }
 
 static bool gui_hide(const clap_plugin_t *plugin)
@@ -786,98 +999,6 @@ static const clap_plugin_gui_t s_gui = {
     .show              = gui_show,
     .hide              = gui_hide,
 };
-
-/* ---- Timer support extension ---- */
-
-static void timer_on_timer(const clap_plugin_t *plugin, clap_id timer_id)
-{
-    M4APluginData *data = (M4APluginData *)plugin->plugin_data;
-    if (!data->gui)
-        return;
-    /* If the host supports timers, only respond to our registered timer.
-     * If not (e.g. standalone without native timer support), accept any id
-     * so an external driver can call on_timer to pump the GUI. */
-    if (data->guiTimerId != CLAP_INVALID_ID && timer_id != data->guiTimerId)
-        return;
-
-    /* Render one GUI frame */
-    m4a_gui_tick(data->gui);
-
-    /* Handle voice restore requests from the voice editor */
-    int restoreIdx;
-    bool voicesChanged = false;
-    while (m4a_gui_poll_voice_restore(data->gui, &restoreIdx)) {
-        if (data->loadedVg && restoreIdx >= 0 && restoreIdx < VOICEGROUP_SIZE) {
-            data->loadedVg->voices[restoreIdx] = data->originalVoices[restoreIdx];
-            data->voiceOverrides[restoreIdx] = false;
-            voicesChanged = true;
-        }
-    }
-
-    /* If any voice was edited or restored, refresh active tracks */
-    if (m4a_gui_poll_voices_dirty(data->gui))
-        voicesChanged = true;
-    if (voicesChanged && data->activated)
-        m4a_engine_refresh_voices(&data->engine);
-
-    /* Apply any settings the user changed */
-    M4AGuiSettings gs;
-    bool reloadVoicegroup = false;
-    if (!m4a_gui_poll_changes(data->gui, &gs, &reloadVoicegroup))
-        return;
-
-    /* Immediate audio settings - safe to write since they're byte-sized */
-    data->reverbAmount     = gs.reverbAmount;
-    data->masterVolume     = gs.masterVolume;
-    data->songMasterVolume = gs.songMasterVolume;
-    data->analogFilter     = gs.analogFilter;
-    data->maxPcmChannels   = gs.maxPcmChannels;
-
-    if (data->activated) {
-        data->engine.masterVolume = gs.masterVolume;
-        m4a_engine_set_song_volume(&data->engine, gs.songMasterVolume);
-        m4a_reverb_set_amount(&data->engine.reverb, gs.reverbAmount);
-        data->engine.analogFilter = gs.analogFilter;
-        data->engine.maxPcmChannels = gs.maxPcmChannels;
-    }
-
-    if (reloadVoicegroup) {
-        /* Update paths, then ask the host to deactivate/reactivate so the new
-         * voicegroup is loaded cleanly from the audio thread's perspective. */
-        snprintf(data->projectRoot,    sizeof(data->projectRoot),
-                 "%s", gs.projectRoot);
-        snprintf(data->voicegroupName, sizeof(data->voicegroupName),
-                 "%s", gs.voicegroupName);
-        data->restartRequested = true;
-        data->host->request_restart(data->host);
-    }
-
-    /* Register this change with the host's undo stack.
-     *
-     * Prefer the CLAP undo draft extension when available: pass no delta so
-     * the host snapshots state via state->save()/state->load().
-     *
-     * Fall back to mark_dirty() for hosts (e.g. Reaper) that don't implement
-     * the draft extension. Per the CLAP spec, mark_dirty() creates an implicit
-     * undo step as long as the plugin hasn't opted into CLAP_EXT_UNDO. */
-    const clap_host_undo_t *hostUndo =
-        (const clap_host_undo_t *)data->host->get_extension(data->host, CLAP_EXT_UNDO);
-    if (hostUndo && hostUndo->change_made) {
-        const char *name = reloadVoicegroup ? "M4A: Reload Voicegroup"
-                                            : "M4A: Settings Change";
-        hostUndo->change_made(data->host, name, NULL, 0, false);
-    } else {
-        const clap_host_state_t *hostState =
-            (const clap_host_state_t *)data->host->get_extension(data->host, CLAP_EXT_STATE);
-        if (hostState && hostState->mark_dirty)
-            hostState->mark_dirty(data->host);
-    }
-
-    /* Reflect updated status back into the GUI (voicegroupLoaded may change
-     * after request_restart completes, but update the rest immediately). */
-    gs.voicegroupLoaded = (data->loadedVg != NULL);
-    m4a_gui_update_settings(data->gui, &gs);
-}
 
 static const clap_plugin_timer_support_t s_timer_support = {
     .on_timer = timer_on_timer,

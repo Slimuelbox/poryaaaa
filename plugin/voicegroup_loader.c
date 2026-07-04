@@ -75,6 +75,11 @@ typedef struct {
 typedef struct {
     char symbol[MAX_SYMBOL_LEN];
     char filePath[MAX_PATH_LEN];
+    /* Inline Golden Sun synth definition (set_synth_* macros) instead of a
+     * sample file.  synthDesc holds the 6 descriptor bytes that follow a
+     * zero-size WaveData header (0x80, type, then 4 pulse parameters). */
+    uint8_t isSynth;
+    uint8_t synthDesc[6];
 } SymbolMapping;
 
 typedef struct {
@@ -291,6 +296,7 @@ static void symbol_map_add(SymbolMap *map, const char *symbol, const char *path)
         map->capacity = map->capacity ? map->capacity * 2 : INITIAL_CAPACITY;
         map->entries = realloc(map->entries, sizeof(SymbolMapping) * map->capacity);
     }
+    memset(&map->entries[map->count], 0, sizeof(SymbolMapping));
     strncpy(map->entries[map->count].symbol, symbol, MAX_SYMBOL_LEN - 1);
     map->entries[map->count].symbol[MAX_SYMBOL_LEN - 1] = '\0';
     strncpy(map->entries[map->count].filePath, path, MAX_PATH_LEN - 1);
@@ -298,11 +304,32 @@ static void symbol_map_add(SymbolMap *map, const char *symbol, const char *path)
     map->count++;
 }
 
+static void symbol_map_add_synth(SymbolMap *map, const char *symbol,
+                                 const uint8_t desc[6])
+{
+    symbol_map_add(map, symbol, "");
+    map->entries[map->count - 1].isSynth = 1;
+    memcpy(map->entries[map->count - 1].synthDesc, desc, 6);
+}
+
+/* Returns the file path for a symbol, or NULL if unknown.  Inline synth
+ * entries have no file and are deliberately not returned here; use
+ * symbol_map_find_synth for those. */
 static const char *symbol_map_find(const SymbolMap *map, const char *symbol)
 {
     for (int i = 0; i < map->count; i++) {
         if (strcmp(map->entries[i].symbol, symbol) == 0)
-            return map->entries[i].filePath;
+            return map->entries[i].isSynth ? NULL : map->entries[i].filePath;
+    }
+    return NULL;
+}
+
+/* Returns the 6 synth descriptor bytes for an inline synth symbol, or NULL. */
+static const uint8_t *symbol_map_find_synth(const SymbolMap *map, const char *symbol)
+{
+    for (int i = 0; i < map->count; i++) {
+        if (strcmp(map->entries[i].symbol, symbol) == 0)
+            return map->entries[i].isSynth ? map->entries[i].synthDesc : NULL;
     }
     return NULL;
 }
@@ -419,6 +446,49 @@ static void scan_dirs_recursive(const char *basePath, int depth, int maxDepth, d
     closedir(d);
 }
 
+/*
+ * Probe for keysplit-table data adjacent to a voicegroup-style directory.
+ * Adds <dir>/keysplit_tables.{s,inc} and any .s/.inc files inside <dir>/keysplits/
+ * to the keySplitTableFiles list. Safe to call repeatedly (pathlist_add dedups).
+ *
+ * This supports project layouts (e.g. the eventide pokeemerald fork) that keep
+ * keysplit tables next to their voicegroups rather than in sound/keysplit_tables.inc.
+ * It is purely additive for standard pokeemerald/pokefirered layouts: if those
+ * files/dirs don't exist it is a no-op, and files in a keysplits/ subdir that turn
+ * out to be sub-voicegroup definitions rather than keysplit tables are harmless --
+ * parse_keysplit_tables_file only acts on lines beginning with "keysplit ".
+ */
+static void probe_keysplit_data_in_dir(const char *dirPath, ProjectDiscovery *out)
+{
+    char p[MAX_PATH_LEN];
+
+    snprintf(p, sizeof(p), "%s%ckeysplit_tables.inc", dirPath, PATH_SEP);
+    if (file_exists(p))
+        pathlist_add(&out->keySplitTableFiles, p);
+    snprintf(p, sizeof(p), "%s%ckeysplit_tables.s", dirPath, PATH_SEP);
+    if (file_exists(p))
+        pathlist_add(&out->keySplitTableFiles, p);
+
+    char ksDir[MAX_PATH_LEN];
+    snprintf(ksDir, sizeof(ksDir), "%s%ckeysplits", dirPath, PATH_SEP);
+    if (is_directory(ksDir)) {
+        DIR *d = opendir(ksDir);
+        if (d) {
+            struct dirent *ent;
+            while ((ent = readdir(d)) != NULL) {
+                if (ent->d_name[0] == '.') continue;
+                if (!str_ends_with_ci(ent->d_name, ".s") &&
+                    !str_ends_with_ci(ent->d_name, ".inc"))
+                    continue;
+                char fp[MAX_PATH_LEN];
+                snprintf(fp, sizeof(fp), "%s%c%s", ksDir, PATH_SEP, ent->d_name);
+                pathlist_add(&out->keySplitTableFiles, fp);
+            }
+            closedir(d);
+        }
+    }
+}
+
 /* Combined visitor context for voicegroup and wav directory discovery */
 typedef struct {
     ProjectDiscovery *disc;
@@ -431,6 +501,7 @@ static void visit_for_voicegroup_and_wav_dirs(const char *dirPath, void *ctx)
         pathlist_add(&vctx->disc->voicegroupDirs, dirPath);
     if (dir_has_files_with_ext(dirPath, ".wav"))
         pathlist_add(&vctx->disc->wavSampleDirs, dirPath);
+    probe_keysplit_data_in_dir(dirPath, vctx->disc);
 }
 
 /*
@@ -517,6 +588,7 @@ static void discover_project(const char *projectRoot,
                     }
                     closedir(d);
                 }
+                probe_keysplit_data_in_dir(path, out);
             } else if (file_exists(path)) {
                 /* It's a file - check if it's monolithic or a voicegroup dir entry */
                 if (is_monolithic_voicegroup_file(path))
@@ -532,6 +604,13 @@ static void discover_project(const char *projectRoot,
 
     /* 2. Standard direct_sound_data.inc, programmable_wave_data.inc, keysplit_tables.inc */
     build_path(path, sizeof(path), projectRoot, "sound/direct_sound_data.inc");
+    if (file_exists(path))
+        pathlist_add(&out->directSoundDataFiles, path);
+
+    /* Inline Golden Sun synth definitions (pokeemerald-expansion layout);
+     * parsed by the same direct_sound_data parser, which recognizes the
+     * set_synth_* macros. */
+    build_path(path, sizeof(path), projectRoot, "sound/direct_sound_synth_data.inc");
     if (file_exists(path))
         pathlist_add(&out->directSoundDataFiles, path);
 
@@ -579,6 +658,52 @@ static void discover_project(const char *projectRoot,
 /* ---- Symbol data file parsing (parameterized by file path) ---- */
 
 /*
+ * Parse a "set_synth_*" macro line into a Golden Sun synth descriptor (the 6
+ * bytes that follow a zero-size WaveData header).  Returns 1 and fills desc
+ * on success, 0 if the line is not a synth macro.  Recognized macros, with
+ * the pokeemerald-expansion names and the preferred aliases:
+ *   set_synth_custom p1, p2, p3, p4   /  set_synth_pulse p1, p2, p3, p4
+ *   set_synth_25                      /  set_synth_saw
+ *   set_synth_50                      /  set_synth_triangle
+ * For the pulse macros: p1 = base duty cycle, p2 = duty LFO step per frame,
+ * p3 = modulation amount, p4 = duty LFO phase offset (0x0-0xFF each).
+ */
+static int parse_synth_macro_line(const char *trimmed, uint8_t desc[6])
+{
+    static const struct { const char *name; uint8_t type; int hasParams; } kMacros[] = {
+        { "set_synth_custom",   0, 1 },
+        { "set_synth_pulse",    0, 1 },
+        { "set_synth_25",       1, 0 },
+        { "set_synth_saw",      1, 0 },
+        { "set_synth_50",       2, 0 },
+        { "set_synth_triangle", 2, 0 },
+    };
+
+    for (size_t m = 0; m < sizeof(kMacros) / sizeof(kMacros[0]); m++) {
+        size_t len = strlen(kMacros[m].name);
+        if (strncmp(trimmed, kMacros[m].name, len) != 0)
+            continue;
+        char next = trimmed[len];
+        if (next != '\0' && next != ' ' && next != '\t')
+            continue;  /* avoid e.g. "set_synth_50" matching "set_synth_5" */
+
+        memset(desc, 0, 6);
+        desc[0] = 0x80;
+        desc[1] = kMacros[m].type;
+        if (kMacros[m].hasParams) {
+            const char *p = trimmed + len;
+            for (int n = 0; n < 4; n++) {
+                while (*p == ' ' || *p == '\t' || *p == ',') p++;
+                if (!*p) break;
+                desc[2 + n] = (uint8_t)strtoul(p, (char **)&p, 0);
+            }
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/*
  * Parse a direct_sound_data .inc file.
  * Builds symbol name -> file path mapping.
  */
@@ -620,6 +745,14 @@ static int parse_direct_sound_data_file(const char *filePath, const char *projec
                 }
             }
             currentSymbol[0] = '\0';
+        }
+        /* Inline Golden Sun synth definitions (set_synth_* macros) */
+        else if (currentSymbol[0]) {
+            uint8_t desc[6];
+            if (parse_synth_macro_line(trimmed, desc)) {
+                symbol_map_add_synth(map, currentSymbol, desc);
+                currentSymbol[0] = '\0';
+            }
         }
     }
 
@@ -1095,16 +1228,13 @@ static WaveData *load_wave_data(const char *projectRoot, const char *relativePat
     uint32_t loopStart = header[8] | (header[9] << 8) | (header[10] << 16) | (header[11] << 24);
     uint32_t size = header[12] | (header[13] << 8) | (header[14] << 16) | (header[15] << 24);
 
-    /* Synth voices (size == 0) have param bytes immediately after the 16-byte header
-     * (pad, type, baseDuty, dutyStep, depth, initDuty).  Read them now before the
-     * allocation so we know how many bytes to reserve. */
-    uint8_t synthParams[8] = {0};
-    uint32_t synthParamCount = 0;
-    if (size == 0)
-        synthParamCount = (uint32_t)fread(synthParams, 1, 8, f);
+    /* A zero-length sample is a Golden Sun synth-instrument descriptor
+     * (ipatix improved-mixer feature): the bytes after the header select the
+     * waveform and pulse parameters instead of holding PCM data.  Keep up to
+     * 16 descriptor bytes so the engine can read them. */
+    uint32_t dataSize = (size > 0) ? size : 16;
 
-    uint32_t allocCount = (size == 0) ? synthParamCount : size;
-    WaveData *wd = malloc(sizeof(WaveData) + allocCount + 1);
+    WaveData *wd = malloc(sizeof(WaveData) + dataSize + 1);
     if (!wd) {
         fclose(f);
         return NULL;
@@ -1119,15 +1249,11 @@ static WaveData *load_wave_data(const char *projectRoot, const char *relativePat
     wd->size = size;
     wd->data = (int8_t *)((uint8_t *)wd + sizeof(WaveData));
 
-    if (size == 0) {
-        memcpy(wd->data, synthParams, synthParamCount);
-        wd->data[synthParamCount] = 0;
-    } else {
-        size_t bytesRead = fread(wd->data, 1, size, f);
-        if (bytesRead < size)
-            memset(wd->data + bytesRead, 0, size - bytesRead);
-        wd->data[size] = wd->data[size - 1];
+    size_t bytesRead = fread(wd->data, 1, dataSize, f);
+    if (bytesRead < dataSize) {
+        memset(wd->data + bytesRead, 0, dataSize - bytesRead);
     }
+    wd->data[dataSize] = wd->data[dataSize - 1];
 
     fclose(f);
     return wd;
@@ -1190,6 +1316,33 @@ static WaveData *resolve_and_load_sample(const char *projectRoot, const char *sy
                                           const SymbolMap *dsMap, const ProjectDiscovery *disc,
                                           LoadedVoiceGroup *vg, WaveCache *waveCache)
 {
+    /* Inline Golden Sun synth definition (set_synth_* macros)?  Build the
+     * WaveData directly: the standard synth header (loop flag, freq
+     * 0x01058920 so the 64-sample wave period lands on middle C, size 0)
+     * followed by the descriptor bytes -- byte-identical to what the macros
+     * assemble on the GBA and to the equivalent .bin sample files. */
+    const uint8_t *synthDesc = symbol_map_find_synth(dsMap, symbol);
+    if (synthDesc) {
+        char cacheKey[MAX_PATH_LEN];
+        snprintf(cacheKey, sizeof(cacheKey), "synth-macro:%s", symbol);
+        WaveData *cached = wave_cache_find(waveCache, cacheKey);
+        if (cached) return cached;
+
+        uint32_t dataSize = 16;
+        WaveData *wd = calloc(1, sizeof(WaveData) + dataSize + 1);
+        if (!wd) return NULL;
+        wd->type = 0;
+        wd->status = 0x4000;
+        wd->freq = 0x01058920;
+        wd->loopStart = 0;
+        wd->size = 0;
+        wd->data = (int8_t *)((uint8_t *)wd + sizeof(WaveData));
+        memcpy(wd->data, synthDesc, 6);
+        vg_register_wavedata(vg, wd);
+        wave_cache_insert(waveCache, cacheKey, wd);
+        return wd;
+    }
+
     const char *samplePath = symbol_map_find(dsMap, symbol);
     if (samplePath) {
         /* Build the absolute .wav path to use as cache key */
@@ -1338,9 +1491,14 @@ static VoicegroupLocation find_voicegroup(const char *projectRoot,
         if (suffix) {
             char baseName[MAX_SYMBOL_LEN];
             int baseLen = (int)(suffix - vgName);
-            if (baseLen > 0 && baseLen < MAX_SYMBOL_LEN) {
+            /* The drumset file keeps whatever follows "_drumset" (e.g.
+             * voicegroup_emerald_drumset_1 -> drumsets/emerald_1.inc, and
+             * voicegroup_frlg_drumset -> drumsets/frlg.inc), so splice the
+             * "_drumset" infix out rather than truncating the name at it. */
+            const char *tail = suffix + 8; /* strlen("_drumset") */
+            if (baseLen > 0 && baseLen + (int)strlen(tail) < MAX_SYMBOL_LEN) {
                 memcpy(baseName, vgName, baseLen);
-                baseName[baseLen] = '\0';
+                strcpy(baseName + baseLen, tail);
                 /* Explicit <dir>/drumsets/<base>.inc probe for each voicegroup dir */
                 for (int i = 0; i < disc->voicegroupDirs.count; i++) {
                     snprintf(path, sizeof(path), "%s%cdrumsets%c%s.inc",
@@ -1492,23 +1650,63 @@ static ToneData *load_sub_voicegroup(const char *projectRoot, const char *vgSymb
     ToneData *subVg = calloc(VOICEGROUP_SIZE, sizeof(ToneData));
     if (!subVg) return NULL;
 
-    ToneData savedVoices[VOICEGROUP_SIZE];
-    memcpy(savedVoices, vg->voices, sizeof(savedVoices));
+    /* The parser writes into vg->voices/voiceNames, so save the caller's
+     * top-level data around the sub-voicegroup parse.  Sub-voice names are
+     * discarded; only top-level names are kept (heap-allocated: the two
+     * arrays are ~30 KB, too big to risk on a plugin-load thread's stack). */
+    ToneData *savedVoices = malloc(sizeof(vg->voices));
+    char (*savedNames)[VG_VOICE_NAME_LEN] = malloc(sizeof(vg->voiceNames));
+    if (!savedVoices || !savedNames) {
+        free(savedVoices);
+        free(savedNames);
+        free(subVg);
+        return NULL;
+    }
+    memcpy(savedVoices, vg->voices, sizeof(vg->voices));
+    memcpy(savedNames, vg->voiceNames, sizeof(vg->voiceNames));
     memset(vg->voices, 0, sizeof(vg->voices));
+    memset(vg->voiceNames, 0, sizeof(vg->voiceNames));
 
     const char *startLabel = loc.label[0] ? loc.label : NULL;
-    if (parse_voicegroup_file(projectRoot, loc.filePath, startLabel,
-                               vg, dsMap, pwMap, ksMap, disc, waveCache) != 0) {
+    int parseResult = parse_voicegroup_file(projectRoot, loc.filePath, startLabel,
+                                            vg, dsMap, pwMap, ksMap, disc, waveCache);
+    if (parseResult == 0)
+        memcpy(subVg, vg->voices, sizeof(ToneData) * VOICEGROUP_SIZE);
+    memcpy(vg->voices, savedVoices, sizeof(vg->voices));
+    memcpy(vg->voiceNames, savedNames, sizeof(vg->voiceNames));
+    free(savedVoices);
+    free(savedNames);
+    if (parseResult != 0) {
         free(subVg);
-        memcpy(vg->voices, savedVoices, sizeof(savedVoices));
         return NULL;
     }
 
-    memcpy(subVg, vg->voices, sizeof(ToneData) * VOICEGROUP_SIZE);
-    memcpy(vg->voices, savedVoices, sizeof(savedVoices));
-
     vg_register_subgroup(vg, subVg);
     return subVg;
+}
+
+/*
+ * Store a friendly display name for a voice slot, derived from the symbol on
+ * the voice's line.  Common symbol prefixes are stripped for readability
+ * (e.g. "DirectSoundWaveData_sc88pro_trumpet" -> "sc88pro_trumpet").
+ */
+static void vg_set_voice_name(LoadedVoiceGroup *vg, int voiceIndex, const char *symbol)
+{
+    if (voiceIndex < 0 || voiceIndex >= VOICEGROUP_SIZE)
+        return;
+    static const char *prefixes[] = {
+        "DirectSoundWaveData_", "ProgrammableWaveData_", "voicegroup_",
+    };
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        size_t len = strlen(prefixes[i]);
+        if (strncmp(symbol, prefixes[i], len) == 0 && symbol[len] != '\0') {
+            symbol += len;
+            break;
+        }
+    }
+    /* Deliberate truncation into the fixed-size display name */
+    strncpy(vg->voiceNames[voiceIndex], symbol, VG_VOICE_NAME_LEN - 1);
+    vg->voiceNames[voiceIndex][VG_VOICE_NAME_LEN - 1] = '\0';
 }
 
 /*
@@ -1591,6 +1789,7 @@ static int parse_voicegroup_file(const char *projectRoot, const char *filePath,
             if (sscanf(trimmed + 30, "%d, %d, %[^,], %d, %d, %d, %d",
                        &key, &pan, sampleSymbol, &attack, &decay, &sustain, &release) == 7) {
                 rtrim(sampleSymbol);
+                vg_set_voice_name(vg, voiceIndex, sampleSymbol);
                 ToneData *td = &vg->voices[voiceIndex];
                 td->type = VOICE_DIRECTSOUND_NO_RESAMPLE;
                 td->key = (uint8_t)key;
@@ -1613,6 +1812,7 @@ static int parse_voicegroup_file(const char *projectRoot, const char *filePath,
             if (sscanf(trimmed + 22, "%d, %d, %[^,], %d, %d, %d, %d",
                        &key, &pan, sampleSymbol, &attack, &decay, &sustain, &release) == 7) {
                 rtrim(sampleSymbol);
+                vg_set_voice_name(vg, voiceIndex, sampleSymbol);
                 ToneData *td = &vg->voices[voiceIndex];
                 td->type = VOICE_DIRECTSOUND_ALT;
                 td->key = (uint8_t)key;
@@ -1635,6 +1835,7 @@ static int parse_voicegroup_file(const char *projectRoot, const char *filePath,
             if (sscanf(trimmed + 18, "%d, %d, %[^,], %d, %d, %d, %d",
                        &key, &pan, sampleSymbol, &attack, &decay, &sustain, &release) == 7) {
                 rtrim(sampleSymbol);
+                vg_set_voice_name(vg, voiceIndex, sampleSymbol);
                 ToneData *td = &vg->voices[voiceIndex];
                 td->type = VOICE_DIRECTSOUND;
                 td->key = (uint8_t)key;
@@ -1727,6 +1928,7 @@ static int parse_voicegroup_file(const char *projectRoot, const char *filePath,
             if (sscanf(trimmed + 27, "%d, %d, %[^,], %d, %d, %d, %d",
                        &key, &pan, waveSymbol, &attack, &decay, &sustain, &release) == 7) {
                 rtrim(waveSymbol);
+                vg_set_voice_name(vg, voiceIndex, waveSymbol);
                 ToneData *td = &vg->voices[voiceIndex];
                 td->type = VOICE_PROGRAMMABLE_WAVE_ALT;
                 td->key = (uint8_t)key;
@@ -1752,6 +1954,7 @@ static int parse_voicegroup_file(const char *projectRoot, const char *filePath,
             if (sscanf(trimmed + 23, "%d, %d, %[^,], %d, %d, %d, %d",
                        &key, &pan, waveSymbol, &attack, &decay, &sustain, &release) == 7) {
                 rtrim(waveSymbol);
+                vg_set_voice_name(vg, voiceIndex, waveSymbol);
                 ToneData *td = &vg->voices[voiceIndex];
                 td->type = VOICE_PROGRAMMABLE_WAVE;
                 td->key = (uint8_t)key;
@@ -1809,6 +2012,7 @@ static int parse_voicegroup_file(const char *projectRoot, const char *filePath,
             char vgSymbol[MAX_SYMBOL_LEN];
             if (sscanf(trimmed + 19, "%s", vgSymbol) == 1) {
                 rtrim(vgSymbol);
+                vg_set_voice_name(vg, voiceIndex, vgSymbol);
                 ToneData *td = &vg->voices[voiceIndex];
                 td->type = VOICE_KEYSPLIT_ALL;
 
@@ -1824,6 +2028,7 @@ static int parse_voicegroup_file(const char *projectRoot, const char *filePath,
             if (sscanf(trimmed + 15, "%[^,], %s", vgSymbol, ksSymbol) == 2) {
                 rtrim(vgSymbol);
                 rtrim(ksSymbol);
+                vg_set_voice_name(vg, voiceIndex, vgSymbol);
                 ToneData *td = &vg->voices[voiceIndex];
                 td->type = VOICE_KEYSPLIT;
 
@@ -1847,6 +2052,7 @@ static int parse_voicegroup_file(const char *projectRoot, const char *filePath,
             char sampleSymbol[MAX_SYMBOL_LEN];
             if (sscanf(trimmed + 12, "%s", sampleSymbol) == 1) {
                 rtrim(sampleSymbol);
+                vg_set_voice_name(vg, voiceIndex, sampleSymbol);
                 ToneData *td = &vg->voices[voiceIndex];
                 td->type = VOICE_CRY_REVERSE;
                 td->key = 60;
@@ -1870,6 +2076,7 @@ static int parse_voicegroup_file(const char *projectRoot, const char *filePath,
             char sampleSymbol[MAX_SYMBOL_LEN];
             if (sscanf(trimmed + 4, "%s", sampleSymbol) == 1) {
                 rtrim(sampleSymbol);
+                vg_set_voice_name(vg, voiceIndex, sampleSymbol);
                 ToneData *td = &vg->voices[voiceIndex];
                 td->type = VOICE_CRY;
                 td->key = 60;

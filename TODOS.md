@@ -5,4 +5,3 @@ This file tracks known issues and to-do items for the plugin.
     - File browser dialog for Project Root not yet implemented.
 - Full midi -> .wav output regression tests
 - Architecture document
-- Identify any performance issues/improvements

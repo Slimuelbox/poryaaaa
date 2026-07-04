@@ -5,6 +5,7 @@
 
 #define VOICEGROUP_SIZE 128
 #define VG_MAX_PATH_LEN 512
+#define VG_VOICE_NAME_LEN 48
 
 /*
  * Optional configuration for the voicegroup loader.
@@ -26,6 +27,13 @@ typedef struct {
  */
 typedef struct {
     ToneData voices[VOICEGROUP_SIZE];
+
+    /* Human-readable name per top-level voice, taken from the symbol on the
+     * voice's line in the voicegroup file (sample symbol for DirectSound
+     * voices, wave symbol for programmable-wave voices, sub-voicegroup symbol
+     * for keysplits/drumkits), with common prefixes stripped.  Empty string
+     * when no meaningful symbol exists (e.g. square/noise voices). */
+    char voiceNames[VOICEGROUP_SIZE][VG_VOICE_NAME_LEN];
 
     /* Loaded wave data (samples) */
     WaveData **waveDatas;

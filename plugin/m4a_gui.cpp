@@ -18,6 +18,11 @@
 #include <stdio.h>
 #include <time.h>
 
+/* Timer ID for the internal render timer 
+    Bitwig does not give the plugin a timer, 
+    so we use a timer from Pugl to drive GUI updates */
+static const uintptr_t RENDER_TIMER_ID = 1;
+
 /* ---- Debug logging ---- */
 static const char *s_logPath = nullptr;
 
@@ -82,13 +87,30 @@ struct M4AGuiState {
     /* True after the user closes the floating window */
     bool wasClosed;
 
+    /* True when the internal pugl render timer is active */
+    bool internalTimerActive;
+    M4AGuiTimerCallback internalTimerCallback;
+    void *internalTimerUserData;
+
     /* Voice editor state */
     ToneData *liveVoices;
     const ToneData *originalVoices;
     bool *voiceOverrides;
+    const char (*voiceNames)[VG_VOICE_NAME_LEN]; /* per-voice display names */
     int selectedVoice;
     int pendingRestoreVoice;  /* -1 = none */
     bool voicesDirty;         /* set when any voice param is edited */
+
+    /* Polyphony monitor: read-only engine view + per-track flash tracking.
+     * prev* snapshots detect counter increases between frames so the table
+     * row can flash the moment a track loses a sound. */
+    M4AEngine *engine;
+    uint32_t polyPrevDrop[MAX_TRACKS];
+    uint32_t polyPrevSteal[MAX_TRACKS];
+    uint32_t polyPrevTailCut[MAX_TRACKS];
+    double   polyFlashTime[MAX_TRACKS]; /* ImGui::GetTime() of last increase */
+    bool     polyPrevValid;             /* prev* snapshots initialized */
+    bool     polyResetRequested;        /* Reset Counters clicked (cleared by poll) */
 };
 
 /* ---- Internal helpers ---- */
@@ -210,6 +232,42 @@ static void render_general_tab(M4AGuiState *gui)
             gui->settingsChanged = true;
         }
     }
+
+    {
+        /* DirectSound (PCM) mixing rate.  The m4a engine mixes PCM at a low-ish sample rate,
+         * so high notes alias audibly; higher rates progressively reduce that. */
+        static const char  *mixRateNames[]  = {
+            "13379 Hz (m4a's default)", "21024 Hz", "31536 Hz", "42048 Hz",
+            "Host rate (clean, no aliasing)"
+        };
+        static const float  mixRateValues[] = {
+            13379.0f, 21024.0f, 31536.0f, 42048.0f, 0.0f
+        };
+        const int mixRateCount = (int)(sizeof(mixRateValues) / sizeof(mixRateValues[0]));
+
+        int curIdx = -1;
+        for (int k = 0; k < mixRateCount; k++) {
+            if (gui->settings.pcmMixRate == mixRateValues[k]) { curIdx = k; break; }
+        }
+        const char *preview = (curIdx >= 0) ? mixRateNames[curIdx] : "Custom";
+        if (ImGui::BeginCombo("PCM Mix Rate", preview)) {
+            for (int k = 0; k < mixRateCount; k++) {
+                bool selected = (k == curIdx);
+                if (ImGui::Selectable(mixRateNames[k], selected)) {
+                    gui->settings.pcmMixRate = mixRateValues[k];
+                    gui->settingsChanged = true;
+                }
+                if (selected)
+                    ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SetItemTooltip(
+            "Rate the DirectSound (PCM) channels are mixed at before upsampling.\n"
+            "The m4a engine uses 13379 Hz by default, so high notes have aliasing.\n"
+            "Higher rates sound better, but are less accurate compared to in-game.");
+    }
+
     if (ImGui::Checkbox("GBA Analog Filter", &gui->settings.analogFilter))
         gui->settingsChanged = true;
 }
@@ -335,6 +393,303 @@ static void render_voices_tab(M4AGuiState *gui)
     }
 }
 
+/* ---- Polyphony monitor tab ---- */
+
+static void midi_note_name(uint8_t key, char *buf, size_t n)
+{
+    static const char *names[12] = { "C", "C#", "D", "D#", "E", "F",
+                                     "F#", "G", "G#", "A", "A#", "B" };
+    snprintf(buf, n, "%s%d", names[key % 12], (int)(key / 12) - 1);
+}
+
+/* One fixed-size channel cell, colored by state:
+ * 0 = free (dark), 1 = active (green), 2 = releasing (amber), 3 = lost sound
+ * playing on a shadow channel (blue).  `id` disambiguates the ImGui ID. */
+static void channel_cell(const char *id, const char *label, int state)
+{
+    static const ImVec4 colors[4] = {
+        ImVec4(0.20f, 0.20f, 0.23f, 1.0f),
+        ImVec4(0.15f, 0.55f, 0.22f, 1.0f),
+        ImVec4(0.72f, 0.53f, 0.10f, 1.0f),
+        ImVec4(0.16f, 0.38f, 0.75f, 1.0f),
+    };
+    char text[80];
+    snprintf(text, sizeof(text), "%s###%s", label, id);
+    ImGui::PushStyleColor(ImGuiCol_Button, colors[state & 3]);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, colors[state & 3]);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, colors[state & 3]);
+    ImGui::Button(text, ImVec2(52, 40));
+    ImGui::PopStyleColor(3);
+}
+
+/* Cell state/label for one PCM channel slot. */
+static int pcm_cell_state(const M4APCMChannel *ch, bool shadow, char *label, size_t n)
+{
+    if (!(ch->status & CHN_ON)) {
+        snprintf(label, n, "--");
+        return 0;
+    }
+    char note[8];
+    midi_note_name(ch->midiKey, note, sizeof(note));
+    snprintf(label, n, "T%d\n%s", ch->trackIndex + 1, note);
+    if (shadow)
+        return 3;
+    return (ch->status & (CHN_STOP | CHN_IEC)) ? 2 : 1;
+}
+
+static int cgb_cell_state(const M4ACGBChannel *ch, bool shadow, const char *name,
+                          char *label, size_t n)
+{
+    if (!(ch->status & CHN_ON)) {
+        snprintf(label, n, "%s\n--", name);
+        return 0;
+    }
+    char note[8];
+    midi_note_name(ch->midiKey, note, sizeof(note));
+    snprintf(label, n, "%s\nT%d %s", name, ch->trackIndex + 1, note);
+    if (shadow)
+        return 3;
+    return (ch->status & (CHN_STOP | CHN_IEC)) ? 2 : 1;
+}
+
+/* Resolve a display name for the instrument on a voicegroup program slot:
+ * the loader-provided symbol name when available, else the voice type name,
+ * else just the program number. */
+static const char *poly_instrument_name(M4AGuiState *gui, uint8_t program,
+                                        char *buf, size_t n)
+{
+    int idx = program & 0x7F;
+    if (gui->voiceNames && gui->voiceNames[idx][0])
+        return gui->voiceNames[idx];
+    if (gui->liveVoices) {
+        snprintf(buf, n, "%s", voice_type_name(gui->liveVoices[idx].type));
+        return buf;
+    }
+    snprintf(buf, n, "prog %d", idx);
+    return buf;
+}
+
+static void render_polyphony_tab(M4AGuiState *gui)
+{
+    M4AEngine *eng = gui->engine;
+    if (!eng || eng->maxPcmChannels == 0) {
+        ImGui::TextColored(ImVec4(0.9f, 0.35f, 0.35f, 1.0f), "Engine not running");
+        return;
+    }
+
+    static const char *cgbNames[MAX_CGB_CHANNELS] = { "Sq1", "Sq2", "Wave", "Noise" };
+    const double now = ImGui::GetTime();
+
+    /* ---- Detect per-track counter increases for the flash effect ---- */
+    for (int t = 0; t < MAX_TRACKS; t++) {
+        uint32_t d = eng->polyDropCount[t];
+        uint32_t s = eng->polyStealCount[t];
+        uint32_t c = eng->polyTailCutCount[t];
+        if (gui->polyPrevValid
+            && (d > gui->polyPrevDrop[t] || s > gui->polyPrevSteal[t]
+                || c > gui->polyPrevTailCut[t]))
+            gui->polyFlashTime[t] = now;
+        gui->polyPrevDrop[t] = d;
+        gui->polyPrevSteal[t] = s;
+        gui->polyPrevTailCut[t] = c;
+    }
+    gui->polyPrevValid = true;
+
+    /* ---- Solo-overflow (invert) toggle ---- */
+    if (ImGui::Checkbox("Solo overflow (invert audio)", &gui->settings.polyDebugInvert))
+        gui->settingsChanged = true;
+    ImGui::SetItemTooltip(
+        "Mutes normal playback and makes ONLY the sounds lost to the polyphony\n"
+        "limit audible.");
+
+    ImGui::Spacing();
+
+    /* ---- Live channel usage ---- */
+    if (ImGui::CollapsingHeader("Channel Usage", ImGuiTreeNodeFlags_DefaultOpen)) {
+        char label[48];
+        for (int i = 0; i < eng->maxPcmChannels; i++) {
+            char id[16];
+            snprintf(id, sizeof(id), "pcm%d", i);
+            int state = pcm_cell_state(&eng->pcmChannels[i], false, label, sizeof(label));
+            if (i > 0) ImGui::SameLine();
+            channel_cell(id, label, state);
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled(" PCM");
+        for (int i = 0; i < MAX_CGB_CHANNELS; i++) {
+            char id[16];
+            snprintf(id, sizeof(id), "cgb%d", i);
+            int state = cgb_cell_state(&eng->cgbChannels[i], false, cgbNames[i],
+                                       label, sizeof(label));
+            if (i > 0) ImGui::SameLine();
+            channel_cell(id, label, state);
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled(" CGB");
+
+        /* In invert mode, also show the shadow pool: the lost sounds being played. */
+        if (gui->settings.polyDebugInvert) {
+            ImGui::Spacing();
+            ImGui::TextDisabled("Lost sounds currently playing (solo overflow):");
+            for (int i = 0; i < MAX_PCM_CHANNELS; i++) {
+                char id[16];
+                snprintf(id, sizeof(id), "spcm%d", i);
+                int state = pcm_cell_state(&eng->pcmChannels[MAX_PCM_CHANNELS + i], true,
+                                           label, sizeof(label));
+                if (i > 0) ImGui::SameLine();
+                channel_cell(id, label, state);
+            }
+            for (int i = 0; i < MAX_CGB_CHANNELS; i++) {
+                char id[16];
+                snprintf(id, sizeof(id), "scgb%d", i);
+                int state = cgb_cell_state(&eng->cgbChannels[MAX_CGB_CHANNELS + i], true,
+                                           cgbNames[i], label, sizeof(label));
+                if (i > 0) ImGui::SameLine();
+                channel_cell(id, label, state);
+            }
+        }
+        ImGui::Spacing();
+    }
+
+    /* ---- Per-track overflow counters ---- */
+    if (ImGui::CollapsingHeader("Overflow by Track", ImGuiTreeNodeFlags_DefaultOpen)) {
+    /* The reset itself is performed by the plugin (via m4a_gui_poll_poly_reset)
+     * so the GUI only ever reads engine state, never mutates it.  The prev*
+     * snapshots need no clearing here: they re-sync from the live counters
+     * every frame, and the flash only triggers on increases. */
+    if (ImGui::Button("Reset Counters")) {
+        gui->polyResetRequested = true;
+        for (int t = 0; t < MAX_TRACKS; t++)
+            gui->polyFlashTime[t] = 0.0;
+    }
+
+    bool anyRows = false;
+    if (ImGui::BeginTable("##polyTable", 4,
+                          ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+        /* Submit the header row cell-by-cell (instead of TableHeadersRow) so
+         * each column label can carry an explanatory hover tooltip. */
+        static const char *columns[4] = { "Track", "Dropped", "Cut Off", "Tail Cut" };
+        static const char *columnHelp[4] = {
+            "Track (MIDI channel) whose sound was lost.",
+            "Notes that never played at all: every channel was in use and\n"
+            "none had low enough priority to steal.  The most audible kind\n"
+            "of overflow because the note is simply missing.",
+            "Notes that were still sounding when a newer note stole their\n"
+            "channel, cutting them off abruptly before their note-off.",
+            "Notes that were already fading out (released) when a newer note\n"
+            "reused their channel.  This shortens the fade-out tail and is\n"
+            "usually the least audible kind of overflow.",
+        };
+        for (int c = 0; c < 4; c++)
+            ImGui::TableSetupColumn(columns[c]);
+        ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
+        for (int c = 0; c < 4; c++) {
+            ImGui::TableSetColumnIndex(c);
+            ImGui::TableHeader(columns[c]);
+            ImGui::SetItemTooltip("%s", columnHelp[c]);
+        }
+        for (int t = 0; t < MAX_TRACKS; t++) {
+            uint32_t d = gui->polyPrevDrop[t];
+            uint32_t s = gui->polyPrevSteal[t];
+            uint32_t c = gui->polyPrevTailCut[t];
+            if (d == 0 && s == 0 && c == 0)
+                continue;
+            anyRows = true;
+            ImGui::TableNextRow();
+            /* Flash the row red for ~1s after a track loses a sound. */
+            float flash = (float)(now - gui->polyFlashTime[t]);
+            if (gui->polyFlashTime[t] > 0.0 && flash < 1.0f) {
+                float alpha = 0.55f * (1.0f - flash);
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                    ImGui::GetColorU32(ImVec4(0.85f, 0.15f, 0.15f, alpha)));
+            }
+            ImGui::TableNextColumn(); ImGui::Text("%d", t + 1);
+            ImGui::TableNextColumn(); ImGui::Text("%u", d);
+            ImGui::TableNextColumn(); ImGui::Text("%u", s);
+            ImGui::TableNextColumn(); ImGui::Text("%u", c);
+        }
+        ImGui::EndTable();
+    }
+    if (!anyRows)
+        ImGui::TextDisabled("No overflow recorded");
+    ImGui::Spacing();
+    }
+
+    /* ---- Recent events, newest first ---- */
+    if (ImGui::CollapsingHeader("Recent Events", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::BeginChild("##polyEvents", ImVec2(0, 0), ImGuiChildFlags_Borders)) {
+            uint32_t total = eng->polyEventTotal;
+            uint32_t shown = total < M4A_POLY_EVENT_CAPACITY ? total : M4A_POLY_EVENT_CAPACITY;
+            if (shown == 0)
+                ImGui::TextDisabled("No overflow events yet");
+            for (uint32_t k = 0; k < shown; k++) {
+                uint32_t idx = total - 1 - k;
+                const M4APolyEvent *ev = &eng->polyEvents[idx % M4A_POLY_EVENT_CAPACITY];
+                char note[8], nameBuf[32];
+                midi_note_name(ev->midiKey, note, sizeof(note));
+                const char *inst = poly_instrument_name(gui, ev->program,
+                                                        nameBuf, sizeof(nameBuf));
+                switch (ev->type) {
+                case M4A_POLY_DROPPED:
+                    ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f),
+                        "#%u  Trk %d  %-4s %s: dropped (no channel available)",
+                        idx + 1, ev->trackIndex + 1, note, inst);
+                    break;
+                case M4A_POLY_STOLEN:
+                    ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.25f, 1.0f),
+                        "#%u  Trk %d  %-4s %s: cut off by Trk %d",
+                        idx + 1, ev->trackIndex + 1, note, inst, ev->byTrack + 1);
+                    break;
+                case M4A_POLY_TAIL_CUT:
+                    ImGui::TextDisabled(
+                        "#%u  Trk %d  %-4s %s: release tail cut by Trk %d",
+                        idx + 1, ev->trackIndex + 1, note, inst, ev->byTrack + 1);
+                    break;
+                }
+            }
+        }
+        ImGui::EndChild();
+    }
+}
+
+/* A toggleable menu item with a checkmark and a hover tooltip.  Flips *value
+ * and flags the settings dirty when clicked.  The tooltip shows on hover even
+ * while the menu popup is open (ImGui shows item tooltips inside menus). */
+static void toggle_menu_item(M4AGuiState *gui, const char *label,
+                             bool *value, const char *help)
+{
+    if (ImGui::MenuItem(label, nullptr, *value)) {
+        *value = !*value;
+        gui->settingsChanged = true;
+    }
+    if (help && help[0])
+        ImGui::SetItemTooltip("%s", help);
+}
+
+/* Top menu bar.  "Options" holds the opt-in effect features as toggleable
+ * (checkmarked) items, each with hover help describing what it does. */
+static void render_menu_bar(M4AGuiState *gui)
+{
+    if (!ImGui::BeginMenuBar())
+        return;
+
+    if (ImGui::BeginMenu("Options")) {
+        toggle_menu_item(gui, "Respect Base MIDI Key", &gui->settings.respectBaseMidiKey,
+            "For PCM (DirectSound) instruments, treat the voice's key field as the\n"
+            "sample's base MIDI note and transpose accordingly, so a pressed note\n"
+            "plays at its intended pitch. Off matches stock pokeemerald behavior.");
+        toggle_menu_item(gui, "Portamento", &gui->settings.portamentoEnabled,
+            "Enable the portamento glide effect (CC 5 = glide time in ticks).\n"
+            "Notes slide smoothly from the previous note's pitch to the new one.");
+        toggle_menu_item(gui, "Pulse-Width Modulation", &gui->settings.pwmEnabled,
+            "Enable pulse-width modulation on the CGB square channels\n"
+            "(CC 0x17 = duty-cycle pattern, CC 0x19 = modulation speed).");
+        ImGui::EndMenu();
+    }
+
+    ImGui::EndMenuBar();
+}
+
 /* Render a single ImGui frame — called from PUGL_EXPOSE. */
 static void render_frame(M4AGuiState *gui)
 {
@@ -355,9 +710,12 @@ static void render_frame(M4AGuiState *gui)
         ImGuiWindowFlags_NoResize        |
         ImGuiWindowFlags_NoMove          |
         ImGuiWindowFlags_NoCollapse      |
+        ImGuiWindowFlags_MenuBar         |
         ImGuiWindowFlags_NoBringToFrontOnFocus;
 
     ImGui::Begin("##Main", nullptr, wflags);
+
+    render_menu_bar(gui);
 
     /* ---- Plugin title ---- */
     ImGui::TextColored(ImVec4(0.3f, 0.75f, 1.0f, 1.0f), "poryaaaa");
@@ -374,6 +732,10 @@ static void render_frame(M4AGuiState *gui)
         }
         if (ImGui::BeginTabItem("Voices")) {
             render_voices_tab(gui);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Polyphony")) {
+            render_polyphony_tab(gui);
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
@@ -407,7 +769,6 @@ static PuglStatus pugl_event_handler(PuglView *view, const PuglEvent *event)
         if (!gui->glInited) {
             ImGui_ImplOpenGL3_Init("#version 330 core");
             gui->glInited = true;
-            gui_log("pugl_event_handler: PUGL_REALIZE, ImGui_ImplOpenGL3_Init done");
         }
         break;
 
@@ -439,9 +800,17 @@ static PuglStatus pugl_event_handler(PuglView *view, const PuglEvent *event)
             render_frame(gui);
         break;
 
+    case PUGL_TIMER:
+        /* The internal Pugl timer drives rendering when the host has no
+         * timer_support. The callback (set in gui_create) routes back into
+         * the plugin's normal timer pump. */
+        if (event->timer.id == RENDER_TIMER_ID && gui->internalTimerCallback)
+            gui->internalTimerCallback(gui->internalTimerUserData);
+        break;
+
     case PUGL_CLOSE:
         gui->wasClosed = true;
-        gui_log("pugl_event_handler: PUGL_CLOSE");
+        m4a_gui_stop_internal_timer(gui);
         if (gui->host) {
             const clap_host_gui_t *hostGui =
                 (const clap_host_gui_t *)gui->host->get_extension(gui->host, CLAP_EXT_GUI);
@@ -457,6 +826,29 @@ static PuglStatus pugl_event_handler(PuglView *view, const PuglEvent *event)
         puglGrabFocus(view);
         ImGui_ImplPugl_ProcessEvent(event);
         break;
+
+    case PUGL_BUTTON_RELEASE:
+        ImGui_ImplPugl_ProcessEvent(event);
+        break;
+
+    case PUGL_KEY_PRESS:
+    case PUGL_KEY_RELEASE:
+    {
+        ImGuiIO &io = ImGui::GetIO();
+
+        /* Tells Pugl to not handle spacebar presses *unless* ImGui wants text input
+        See third_party/pugl/mac.m > key_down handler for more details */
+        const PuglMods mods = event->key.state;
+        const bool plainSpace =
+            event->key.key == PUGL_KEY_SPACE &&
+            (mods & (PUGL_MOD_SHIFT | PUGL_MOD_CTRL | PUGL_MOD_ALT | PUGL_MOD_SUPER)) == 0;
+
+        if (gui->isEmbedded && plainSpace && !io.WantTextInput) // in case ur focusing text input
+            return PUGL_UNSUPPORTED;
+
+        ImGui_ImplPugl_ProcessEvent(event);
+        break;
+    }
 
     default:
         /* Forward all other input events to ImGui */
@@ -475,7 +867,6 @@ M4AGuiState *m4a_gui_create(const clap_host_t *host, const M4AGuiSettings *initi
                              const char *log_path)
 {
     s_logPath = log_path;
-    gui_log("m4a_gui_create: begin");
 
     M4AGuiState *gui = new M4AGuiState();
     memset(gui, 0, sizeof(*gui));
@@ -491,6 +882,7 @@ M4AGuiState *m4a_gui_create(const clap_host_t *host, const M4AGuiSettings *initi
         memset(&gui->settings, 0, sizeof(gui->settings));
         gui->settings.masterVolume     = 15;
         gui->settings.songMasterVolume = 127;
+        gui->settings.pcmMixRate       = 13379.0f;
     }
     sync_buffers(gui);
 
@@ -560,7 +952,9 @@ void m4a_gui_destroy(M4AGuiState *gui)
     if (!gui)
         return;
 
-    gui_log("m4a_gui_destroy: begin");
+
+    /* Stop the internal render timer before tearing down GL/ImGui */
+    m4a_gui_stop_internal_timer(gui);
 
     ImGui::SetCurrentContext(gui->imguiCtx);
 
@@ -573,7 +967,6 @@ void m4a_gui_destroy(M4AGuiState *gui)
         ImGui_ImplOpenGL3_Shutdown();
         gui->glInited = false;
         puglLeaveContext(gui->view);
-        gui_log("m4a_gui_destroy: ImGui_ImplOpenGL3_Shutdown done");
     }
 
     ImGui_ImplPugl_Shutdown();
@@ -633,15 +1026,16 @@ bool m4a_gui_show(M4AGuiState *gui)
         gui_log("m4a_gui_show: realized as floating");
     }
 
-    puglShow(gui->view, PUGL_SHOW_RAISE);
-    gui_log("m4a_gui_show: shown");
+    /* Embedded views must not manipulate the host's window (orderFront etc.),
+     * so use PUGL_SHOW_PASSIVE.  Floating windows should raise normally. */
+    puglShow(gui->view, gui->isEmbedded ? PUGL_SHOW_PASSIVE : PUGL_SHOW_RAISE);
     return true;
 }
 
 bool m4a_gui_hide(M4AGuiState *gui)
 {
-    gui_log("m4a_gui_hide called");
     if (!gui || !gui->view) return false;
+    m4a_gui_stop_internal_timer(gui);
     puglHide(gui->view);
     return true;
 }
@@ -653,15 +1047,25 @@ void m4a_gui_get_size(M4AGuiState *gui, uint32_t *width, uint32_t *height)
         *height = (uint32_t)GUI_H;
         return;
     }
-    *width  = gui->cachedWidth;
-    *height = gui->cachedHeight;
+    /* cachedWidth/Height are in backing pixels (from Pugl CONFIGURE).
+     * The CLAP host expects logical pixels (points on macOS), so divide
+     * by the backing scale factor. */
+    double scale = gui->view ? puglGetScaleFactor(gui->view) : 1.0;
+    if (scale < 1.0) scale = 1.0;
+    *width  = (uint32_t)(gui->cachedWidth  / scale);
+    *height = (uint32_t)(gui->cachedHeight / scale);
 }
 
 bool m4a_gui_set_size(M4AGuiState *gui, uint32_t width, uint32_t height)
 {
     if (!gui || !gui->view) return false;
-    gui_log("m4a_gui_set_size: %ux%u", width, height);
-    puglSetSizeHint(gui->view, PUGL_CURRENT_SIZE, (PuglSpan)width, (PuglSpan)height);
+    /* The host sends logical pixels; Pugl's PUGL_CURRENT_SIZE expects
+     * backing pixels, so scale up. */
+    double scale = puglGetScaleFactor(gui->view);
+    if (scale < 1.0) scale = 1.0;
+    PuglSpan pw = (PuglSpan)(width  * scale);
+    PuglSpan ph = (PuglSpan)(height * scale);
+    puglSetSizeHint(gui->view, PUGL_CURRENT_SIZE, pw, ph);
     return true;
 }
 
@@ -706,15 +1110,34 @@ void m4a_gui_tick(M4AGuiState *gui)
     puglUpdate(gui->world, 0.0);
 }
 
+void m4a_gui_set_internal_timer_callback(M4AGuiState *gui,
+                                          M4AGuiTimerCallback callback,
+                                          void *user_data)
+{
+    if (!gui)
+        return;
+    gui->internalTimerCallback = callback;
+    gui->internalTimerUserData = user_data;
+}
+
+void m4a_gui_set_engine(M4AGuiState *gui, M4AEngine *engine)
+{
+    if (!gui) return;
+    gui->engine = engine;
+    gui->polyPrevValid = false;
+}
+
 void m4a_gui_set_voice_data(M4AGuiState *gui,
                              ToneData *liveVoices,
                              const ToneData *originalVoices,
-                             bool *overrides)
+                             bool *overrides,
+                             const char (*voiceNames)[VG_VOICE_NAME_LEN])
 {
     if (!gui) return;
     gui->liveVoices     = liveVoices;
     gui->originalVoices = originalVoices;
     gui->voiceOverrides = overrides;
+    gui->voiceNames     = voiceNames;
     if (!liveVoices)
         gui->pendingRestoreVoice = -1;
 }
@@ -728,6 +1151,14 @@ bool m4a_gui_poll_voice_restore(M4AGuiState *gui, int *voiceIndex)
     return true;
 }
 
+bool m4a_gui_poll_poly_reset(M4AGuiState *gui)
+{
+    if (!gui || !gui->polyResetRequested)
+        return false;
+    gui->polyResetRequested = false;
+    return true;
+}
+
 bool m4a_gui_poll_voices_dirty(M4AGuiState *gui)
 {
     if (!gui || !gui->voicesDirty)
@@ -736,4 +1167,23 @@ bool m4a_gui_poll_voices_dirty(M4AGuiState *gui)
     return true;
 }
 
+void m4a_gui_start_internal_timer(M4AGuiState *gui)
+{
+    if (!gui || !gui->view || !gui->realized)
+        return;
+    if (gui->internalTimerActive)
+        return;
+    PuglStatus st = puglStartTimer(gui->view, RENDER_TIMER_ID, 1.0 / 60.0);
+    if (st == PUGL_SUCCESS)
+        gui->internalTimerActive = true;
+}
+
+void m4a_gui_stop_internal_timer(M4AGuiState *gui)
+{
+    if (!gui || !gui->view || !gui->internalTimerActive)
+        return;
+
+    puglStopTimer(gui->view, RENDER_TIMER_ID);
+    gui->internalTimerActive = false;
+}
 } /* extern "C" */

@@ -36,7 +36,13 @@ Audio options:
   --analog-filter             Enable GBA analog low-pass filter (default: off)
   --polyphony <1-12>          Max simultaneous PCM channels (default: 5)
   --sample-rate <hz>          Sample rate in Hz (default: 44100)
+  --pcm-mix-rate <hz>         DirectSound (PCM) mix rate; 0 means same as sample-rate (default: 13379)
   --tail <seconds>            Silence after last event, no loop markers (default: 3.0)
+
+Opt-in effect features (off by default; extend the stock m4a engine):
+  --respect-base-midi-key     Treat a PCM voice's key as the sample's base MIDI note
+  --portamento                Enable the portamento glide effect (CC 5)
+  --pwm                       Enable pulse-width modulation on CGB square channels (CC 0x17/0x19)
 
 Loop options (when MIDI contains '[' / ']' text events):
   --loop-count <n>            Number of loop body repetitions (default: 2)
@@ -44,6 +50,8 @@ Loop options (when MIDI contains '[' / ']' text events):
   --total-duration-seconds <s>  Override loop-count; set exact total duration
                                 (fadeout occupies the final --fadeout seconds)
 ```
+
+The opt-in effect features require the matching m4a engine extensions in your project. See [huderlem/pokeemerald @ m4a_extensions](https://github.com/huderlem/pokeemerald/tree/m4a_extensions).
 
 Examples:
 
@@ -148,17 +156,26 @@ The plugin reads `poryaaaa.cfg` on startup for initial defaults. All settings ca
 | `reverb` | `0` | Reverb amount (0–127) |
 | `master_volume` | `15` | M4A master volume (0–15) |
 | `song_master_volume` | `127` | Song-level volume multiplier (0–127) |
+| `max_channels` | `5` | Max simultaneous PCM (DirectSound) channels (1–12) |
+| `pcm_mix_rate` | `13379` | DirectSound (PCM) mix rate in Hz; `13379` = GBA-accurate aliasing, `0` = follow host rate (clean) |
+| `respect_base_midi_key` | `0` | Opt-in: treat a PCM voice's key as the sample's base MIDI note so pressed notes play at the intended pitch |
+| `portamento` | `0` | Opt-in: enable the portamento glide effect (CC 5 = glide time in ticks) |
+| `pwm` | `0` | Opt-in: enable pulse-width modulation on CGB square channels (CC 0x17 / 0x19) |
 | `sound_data_paths` | *(auto)* | Extra `.inc` files for sample symbols (semicolon-separated, relative to project root) |
 | `voicegroup_paths` | *(auto)* | Extra voicegroup search directories or files |
 | `sample_dirs` | *(auto)* | Extra `.wav` sample search directories |
 | `log` | *(off)* | Diagnostic log file path |
 
+The opt-in effect features (`respect_base_midi_key`, `portamento`, `pwm`) require the matching m4a engine extensions in your project. See [huderlem/pokeemerald @ m4a_extensions](https://github.com/huderlem/pokeemerald/tree/m4a_extensions).
+
 #### GUI
 
-The plugin opens a settings panel built with [Dear ImGui](https://github.com/ocornut/imgui) and [GLFW](https://www.glfw.org/):
+The plugin opens a settings panel built with [Dear ImGui](https://github.com/ocornut/imgui) and [Pugl](https://github.com/lv2/pugl) (a lightweight embeddable windowing library):
 
-- **Project Root** / **Voicegroup**: edit and press **Reload** to apply
-- **Song Volume** (0–127), **Reverb** (0–127): take effect immediately
+- **General** tab — **Project Root** / **Voicegroup**: edit and press **Reload** to apply; **Song Volume** (0–127), **Reverb** (0–127), **Polyphony**, **GBA Analog Filter**, and **PCM Mix Rate** take effect immediately
+- **Voices** tab — inspect and edit individual voices in the loaded voicegroup
+- **Polyphony** tab — realtime monitor for debugging polyphony overflow
+- **Options** menu — toggle the opt-in effect features (Respect Base MIDI Key, Portamento, Pulse-Width Modulation); hover an item for help text. Toggles take effect immediately and are saved per project.
 
 On Windows the GUI is embedded inside the DAW's FX window. On Linux/macOS it opens as a floating window.
 
@@ -217,7 +234,8 @@ cmd/
 
 plugin/
   m4a_plugin.c/.h             CLAP entry point, MIDI event handling, extension dispatch
-  m4a_gui.cpp/.h              Dear ImGui + GLFW settings GUI (C++ with C interface)
+  m4a_gui.cpp/.h              Dear ImGui + Pugl settings GUI (C++ with C interface)
+  imgui_impl_pugl.cpp/.h      Custom ImGui Pugl windowing backend
   m4a_engine.c/.h             Core engine: tick processing, channel allocation, MIDI routing
   m4a_channel.c/.h            PCM and CGB channel rendering, ADSR envelopes
   m4a_tables.c/.h             Frequency/scale tables (from m4a_tables.c)
@@ -231,10 +249,10 @@ test/
 
 third_party/
   miniaudio.h            Single-header audio I/O library (used by poryaaaa_render)
+  pugl/                  Vendored Pugl windowing library (GUI backend)
 
 clap-sdk/                CLAP plugin SDK (submodule)
 clap-wrapper/            Wraps the CLAP plugin as a standalone app (submodule)
-glfw/                    GLFW 3.4 (submodule)
 imgui/                   Dear ImGui (submodule)
 ```
 
@@ -252,7 +270,7 @@ imgui/                   Dear ImGui (submodule)
 
 The engine runs a **tick** at the GBA's VBlank rate (~59.7 Hz) to advance envelopes and LFO, while rendering audio sample-by-sample at the configured sample rate (typically 44100 or 48000 Hz).
 
-**PCM channels** use the same 23-bit fractional sample position and linear interpolation as the GBA's `SoundMainRAM` mixer. Frequency is computed using `MidiKeyToFreq` with the exact scale/frequency table lookups, then scaled from the GBA's ~13379 Hz output rate to the target sample rate.
+**PCM channels** use the same 23-bit fractional sample position and linear interpolation as the GBA's `SoundMainRAM` mixer. Frequency is computed using `MidiKeyToFreq` with the exact scale/frequency table lookups. The channels (and the DirectSound reverb) are mixed at the configurable **PCM mix rate** — 13379 Hz by default, matching the GBA's hardware DirectSound rate — then linearly upsampled to the output sample rate. Because the hardware mixes at that low rate, pitched-up high notes alias below its ~6.7 kHz Nyquist exactly as they do in-game; raising the mix rate (up to "host rate") progressively removes that aliasing at the cost of accuracy. **CGB channels** are synthesized directly at the output rate and mixed in after the upsample.
 
 **CGB channels** are synthesized in software: square waves use an 8-step duty cycle pattern with a phase accumulator, programmable wave reads 4-bit nibbles from 16-byte waveforms, and noise uses a 15-bit LFSR.
 
@@ -269,6 +287,15 @@ The loader auto-discovers and parses project assembly source files at runtime:
 5. **Sample loading**: loads `.wav` samples with a deduplication cache. When a sample symbol isn't found in the symbol map, the loader falls back to searching discovered `.wav` directories.
 
 Keysplit and drumset sub-voicegroups are resolved recursively across all discovered voicegroup directories. Additional search paths can be configured for projects with non-standard layouts.
+
+### Golden Sun synth instruments
+
+Poryaaaa supports the synthesized instruments from Golden Sun's custom mixer, as featured in [ipatix's improved ("HQ") mixer](https://github.com/ipatix/gba-hq-mixer): pulse wave (with duty-cycle modulation), pseudo-sawtooth, and triangle. A DirectSound voice whose sample has a length of zero is played as one of these synth tones instead of PCM data. Support is always enabled — projects without synth samples are unaffected.
+
+Both ways of defining synth voices are recognized:
+
+- **Binary samples**: a `.bin` sample with size 0 whose data bytes select the waveform and pulse parameters, referenced from `direct_sound_data.inc` like any other sample.
+- **Assembly macros**: inline `set_synth_pulse p1, p2, p3, p4`, `set_synth_saw`, and `set_synth_triangle` definitions, auto-discovered from `sound/direct_sound_synth_data.inc`. The alias names `set_synth_custom`, `set_synth_25`, and `set_synth_50` are also accepted.
 
 ## GBA source reference
 
