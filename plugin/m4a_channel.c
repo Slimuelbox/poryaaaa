@@ -27,6 +27,13 @@ void m4a_pcm_channel_start(M4APCMChannel *ch, WaveData *wav, uint8_t type)
         ch->loopLen = 0;
         ch->loopStart = NULL;
         ch->fw = (synthType == 2) ? 0x40000000 : 0;
+    } else if (type == VOICE_CRY_REVERSE) {
+        ch->currentPointer = wav->data + wav->size - 1;
+        ch->count = wav->size;
+        ch->fw = 0;
+        ch->isLoop = false;
+        ch->loopLen = 0;
+        ch->loopStart = NULL;
     } else {
         ch->currentPointer = wav->data;
         ch->count = wav->size;
@@ -228,16 +235,19 @@ void m4a_pcm_channel_render(M4APCMChannel *ch, int32_t *mixL, int32_t *mixR)
     int32_t count = ch->count;
     int32_t sample;
 
+    bool isReverse = (ch->type == VOICE_CRY_REVERSE);
+
     if (ch->type & VOICE_TYPE_FIX) {
-        // Fixed-frequency (no resample): no interpolation.
         sample = ptr[0];
+    } else if (isReverse) {
+        int8_t s0 = ptr[0];
+        int8_t s1 = (ptr > ch->wav->data) ? ptr[-1] : s0;
+        int32_t diff = s1 - s0;
+        sample = s0 + (int32_t)(((int64_t)diff * (int32_t)fw) >> 23);
     } else {
-        // Interpolating mixer
         int8_t s0 = ptr[0];
         int8_t s1 = ptr[1];
         int32_t diff = s1 - s0;
-
-        /* Linear interpolation using top bits of fw as fraction */
         sample = s0 + (int32_t)(((int64_t)diff * (int32_t)fw) >> 23);
     }
 
@@ -253,7 +263,7 @@ void m4a_pcm_channel_render(M4APCMChannel *ch, int32_t *mixL, int32_t *mixR)
         fw &= 0x7FFFFF;  /* keep fractional part */
         count -= advance;
         if (count <= 0) {
-            if (ch->isLoop && ch->loopLen > 0) {
+            if (!isReverse && ch->isLoop && ch->loopLen > 0) {
                 /* Wrap around loop */
                 while (count <= 0)
                     count += ch->loopLen;
@@ -261,6 +271,8 @@ void m4a_pcm_channel_render(M4APCMChannel *ch, int32_t *mixL, int32_t *mixR)
             } else {
                 ch->status = 0;
             }
+        } else if (isReverse) {
+            ptr -= advance;
         } else {
             ptr += advance;
         }
