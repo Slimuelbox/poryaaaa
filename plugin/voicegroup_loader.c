@@ -6,14 +6,78 @@
 #include <math.h>
 #include <time.h>
 #include <stdarg.h>
-#include <dirent.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <dirent.h>
+#endif
 
 #ifdef _WIN32
 #define PATH_SEP '\\'
 #else
 #define PATH_SEP '/'
 #endif
+
+/* MSVC's sys/stat.h lacks the POSIX S_IS* predicate macros. */
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
+#endif
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+#endif
+
+#ifdef _WIN32
+/*
+ * Minimal dirent shim over FindFirstFile.  Only d_name is used in this file,
+ * and directory iteration is strictly sequential (never concurrent), so a
+ * single static dirent entry per stream is sufficient.
+ */
+struct dirent {
+    char d_name[MAX_PATH];
+};
+
+typedef struct {
+    HANDLE handle;
+    WIN32_FIND_DATAA findData;
+    int first;
+    struct dirent entry;
+} DIR;
+
+static DIR *opendir(const char *path)
+{
+    char pattern[MAX_PATH];
+    if (snprintf(pattern, sizeof(pattern), "%s\\*", path) >= (int)sizeof(pattern))
+        return NULL;
+    DIR *d = (DIR *)calloc(1, sizeof(DIR));
+    if (!d) return NULL;
+    d->handle = FindFirstFileA(pattern, &d->findData);
+    if (d->handle == INVALID_HANDLE_VALUE) {
+        free(d);
+        return NULL;
+    }
+    d->first = 1;
+    return d;
+}
+
+static struct dirent *readdir(DIR *d)
+{
+    if (d->first)
+        d->first = 0;
+    else if (!FindNextFileA(d->handle, &d->findData))
+        return NULL;
+    snprintf(d->entry.d_name, sizeof(d->entry.d_name), "%s", d->findData.cFileName);
+    return &d->entry;
+}
+
+static int closedir(DIR *d)
+{
+    FindClose(d->handle);
+    free(d);
+    return 0;
+}
+#endif /* _WIN32 */
 
 #define MAX_LINE 1024
 #define MAX_PATH_LEN 512
@@ -634,9 +698,6 @@ static void discover_project(const char *projectRoot,
         snprintf(subPath, sizeof(subPath), "%s%cdrumsets", path, PATH_SEP);
         if (is_directory(subPath))
             pathlist_add(&out->voicegroupDirs, subPath);
-        snprintf(subPath, sizeof(subPath), "%s%csamplechops", path, PATH_SEP);
-        if (is_directory(subPath))
-            pathlist_add(&out->voicegroupDirs, subPath);
     }
 
     /* 4. Scan under sound/ for voicegroup dirs AND wav dirs in one pass */
@@ -1228,7 +1289,13 @@ static WaveData *load_wave_data(const char *projectRoot, const char *relativePat
     uint32_t loopStart = header[8] | (header[9] << 8) | (header[10] << 16) | (header[11] << 24);
     uint32_t size = header[12] | (header[13] << 8) | (header[14] << 16) | (header[15] << 24);
 
-    WaveData *wd = malloc(sizeof(WaveData) + size + 1);
+    /* A zero-length sample is a Golden Sun synth-instrument descriptor
+     * (ipatix improved-mixer feature): the bytes after the header select the
+     * waveform and pulse parameters instead of holding PCM data.  Keep up to
+     * 16 descriptor bytes so the engine can read them. */
+    uint32_t dataSize = (size > 0) ? size : 16;
+
+    WaveData *wd = malloc(sizeof(WaveData) + dataSize + 1);
     if (!wd) {
         fclose(f);
         return NULL;
@@ -1243,11 +1310,11 @@ static WaveData *load_wave_data(const char *projectRoot, const char *relativePat
     wd->size = size;
     wd->data = (int8_t *)((uint8_t *)wd + sizeof(WaveData));
 
-    size_t bytesRead = fread(wd->data, 1, size, f);
-    if (bytesRead < size) {
-        memset(wd->data + bytesRead, 0, size - bytesRead);
+    size_t bytesRead = fread(wd->data, 1, dataSize, f);
+    if (bytesRead < dataSize) {
+        memset(wd->data + bytesRead, 0, dataSize - bytesRead);
     }
-    wd->data[size] = wd->data[size > 0 ? size - 1 : 0];
+    wd->data[dataSize] = wd->data[dataSize - 1];
 
     fclose(f);
     return wd;
@@ -1513,51 +1580,6 @@ static VoicegroupLocation find_voicegroup(const char *projectRoot,
                 /* Also check dirs that are themselves named "drumsets" */
                 for (int i = 0; i < disc->voicegroupDirs.count; i++) {
                     if (!dir_last_component_is(disc->voicegroupDirs.paths[i], "drumsets"))
-                        continue;
-                    snprintf(path, sizeof(path), "%s%c%s.inc", disc->voicegroupDirs.paths[i], PATH_SEP, baseName);
-                    if (file_exists(path)) {
-                        strncpy(loc.filePath, path, MAX_PATH_LEN - 1);
-                        loc.found = 1;
-                        return loc;
-                    }
-                    snprintf(path, sizeof(path), "%s%c%s.s", disc->voicegroupDirs.paths[i], PATH_SEP, baseName);
-                    if (file_exists(path)) {
-                        strncpy(loc.filePath, path, MAX_PATH_LEN - 1);
-                        loc.found = 1;
-                        return loc;
-                    }
-                }
-            }
-        }
-    }
-    {
-        const char *suffix = strstr(vgName, "_samplechop");
-        if (suffix) {
-            char baseName[MAX_SYMBOL_LEN];
-            int baseLen = (int)(suffix - vgName);
-            if (baseLen > 0 && baseLen < MAX_SYMBOL_LEN) {
-                memcpy(baseName, vgName, baseLen);
-                baseName[baseLen] = '\0';
-                /* Explicit <dir>/samplechops/<base>.inc probe for each voicegroup dir */
-                for (int i = 0; i < disc->voicegroupDirs.count; i++) {
-                    snprintf(path, sizeof(path), "%s%csamplechops%c%s.inc",
-                             disc->voicegroupDirs.paths[i], PATH_SEP, PATH_SEP, baseName);
-                    if (file_exists(path)) {
-                        strncpy(loc.filePath, path, MAX_PATH_LEN - 1);
-                        loc.found = 1;
-                        return loc;
-                    }
-                    snprintf(path, sizeof(path), "%s%csamplechops%c%s.s",
-                             disc->voicegroupDirs.paths[i], PATH_SEP, PATH_SEP, baseName);
-                    if (file_exists(path)) {
-                        strncpy(loc.filePath, path, MAX_PATH_LEN - 1);
-                        loc.found = 1;
-                        return loc;
-                    }
-                }
-                /* Also check dirs that are themselves named "samplechops" */
-                for (int i = 0; i < disc->voicegroupDirs.count; i++) {
-                    if (!dir_last_component_is(disc->voicegroupDirs.paths[i], "samplechops"))
                         continue;
                     snprintf(path, sizeof(path), "%s%c%s.inc", disc->voicegroupDirs.paths[i], PATH_SEP, baseName);
                     if (file_exists(path)) {
@@ -2086,50 +2108,6 @@ static int parse_voicegroup_file(const char *projectRoot, const char *filePath,
                         td->wav = wd;
                         vg_register_wavedata(vg, wd);
                     }
-                }
-            }
-            voiceIndex++;
-            voicesParsedInSection++;
-        } else if (strncmp(trimmed, "voice_directsound_compressed_reverse ", 37) == 0) {
-            int key, pan, attack, decay, sustain, release;
-            char sampleSymbol[MAX_SYMBOL_LEN];
-            if (sscanf(trimmed + 37, "%d, %d, %[^,], %d, %d, %d, %d",
-                       &key, &pan, sampleSymbol, &attack, &decay, &sustain, &release) == 7) {
-                rtrim(sampleSymbol);
-                ToneData *td = &vg->voices[voiceIndex];
-                td->type = VOICE_CRY_REVERSE;
-                td->key = (uint8_t)key;
-                td->panSweep = pan ? (0x80 | pan) : 0;
-                td->attack = (uint8_t)attack;
-                td->decay = (uint8_t)decay;
-                td->sustain = (uint8_t)sustain;
-                td->release = (uint8_t)release;
-
-                WaveData *wd = resolve_and_load_sample(projectRoot, sampleSymbol, dsMap, disc, vg, waveCache);
-                if (wd) {
-                    td->wav = wd;
-                }
-            }
-            voiceIndex++;
-            voicesParsedInSection++;
-        } else if (strncmp(trimmed, "voice_directsound_compressed ", 29) == 0) {
-            int key, pan, attack, decay, sustain, release;
-            char sampleSymbol[MAX_SYMBOL_LEN];
-            if (sscanf(trimmed + 29, "%d, %d, %[^,], %d, %d, %d, %d",
-                       &key, &pan, sampleSymbol, &attack, &decay, &sustain, &release) == 7) {
-                rtrim(sampleSymbol);
-                ToneData *td = &vg->voices[voiceIndex];
-                td->type = VOICE_CRY;
-                td->key = (uint8_t)key;
-                td->panSweep = pan ? (0x80 | pan) : 0;
-                td->attack = (uint8_t)attack;
-                td->decay = (uint8_t)decay;
-                td->sustain = (uint8_t)sustain;
-                td->release = (uint8_t)release;
-
-                WaveData *wd = resolve_and_load_sample(projectRoot, sampleSymbol, dsMap, disc, vg, waveCache);
-                if (wd) {
-                    td->wav = wd;
                 }
             }
             voiceIndex++;

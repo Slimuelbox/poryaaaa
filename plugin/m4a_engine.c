@@ -139,14 +139,12 @@ static void chn_vol_set(M4APCMChannel *ch, M4ATrack *track)
     uint32_t panR = (uint32_t)(0x80 + rhythmPan);
     uint32_t volR = panR * velocity;
     uint32_t result = (volR * track->volMR) >> 14;
-    if (track->volumeBoost) result <<= 1;
     if (result > 0xFF) result = 0xFF;
     ch->rightVolume = (uint8_t)result;
 
     uint32_t panL = (uint32_t)(0x7F - rhythmPan);
     uint32_t volL = panL * velocity;
     result = (volL * track->volML) >> 14;
-    if (track->volumeBoost) result <<= 1;
     if (result > 0xFF) result = 0xFF;
     ch->leftVolume = (uint8_t)result;
 }
@@ -158,14 +156,12 @@ static void cgb_chn_vol_set(M4ACGBChannel *ch, M4ATrack *track)
     uint32_t panR = (uint32_t)(0x80 + rhythmPan);
     uint32_t volR = panR * velocity;
     uint32_t result = (volR * track->volMR) >> 14;
-    if (track->volumeBoost) result <<= 1;
     if (result > 0xFF) result = 0xFF;
     ch->rightVolume = (uint8_t)result;
 
     uint32_t panL = (uint32_t)(0x7F - rhythmPan);
     uint32_t volL = panL * velocity;
     result = (volL * track->volML) >> 14;
-    if (track->volumeBoost) result <<= 1;
     if (result > 0xFF) result = 0xFF;
     ch->leftVolume = (uint8_t)result;
 }
@@ -544,9 +540,6 @@ void m4a_engine_note_on(M4AEngine *engine, int trackIndex, uint8_t key, uint8_t 
 
     /* Calculate combined priority */
     uint8_t combinedPriority = track->priority;
-
-    /* Reset LFO delay countdown (ply_note resets lfoDelayC = lfoDelay on note trigger) */
-    track->lfoDelayC = track->lfoDelay;
 
     /* Calculate track volumes */
     m4a_track_vol_pit_set(track);
@@ -949,11 +942,7 @@ void m4a_engine_cc(M4AEngine *engine, int trackIndex, uint8_t cc, uint8_t value)
             clear_mod_m(engine, track, trackIndex);
         break;
     case 0x16: /* Modulation type (MODT) */
-        if (track->modT != value) {
-            track->modT = value;
-            refresh_volumes(engine, track, trackIndex);
-            refresh_channel_pitches(engine, track, trackIndex);
-        }
+        // TODO: none of the pokemon emerald songs use MODT
         break;
     case 0x17: { /* Pulse-width mod duty-cycle pattern (PWMC); 0 = disable.
                   * Opt-in: ignored unless the PWM feature is enabled.  Mirrors
@@ -998,31 +987,10 @@ void m4a_engine_cc(M4AEngine *engine, int trackIndex, uint8_t cc, uint8_t value)
         }
         break;
     case 0x18: /* Micro tuning (TUNE) */
-        track->tune = (int8_t)(value - 0x40);
-        m4a_track_vol_pit_set(track);
-        refresh_channel_pitches(engine, track, trackIndex);
+        // TODO: none of the pokemon emerald songs use TUNE
         break;
     case 0x1A: /* LFO delay (LFODL) */
-        track->lfoDelay = value;
-        break;
-    case 0x19: /* Volume boost: non-zero doubles channel volume */
-        track->volumeBoost = value;
-        m4a_track_vol_pit_set(track);
-        refresh_volumes(engine, track, trackIndex);
-        break;
-    case 0x1D: /* Extended command selector (XCMD part 1) */
-    case 0x1F:
-        track->extendedCommand = value;
-        break;
-    case 0x1E: /* Extended command value (XCMD part 2) */
-        switch (track->extendedCommand) {
-        case 0x08: /* xIECV - pseudo-echo volume */
-            track->pseudoEchoVolume = value;
-            break;
-        case 0x09: /* xIECL - pseudo-echo length */
-            track->pseudoEchoLength = value;
-            break;
-        }
+        // TODO: none of the pokemon emerald songs use LFODL
         break;
     case 0x7B: /* All Notes Off */
         m4a_engine_all_notes_off(engine, trackIndex);
