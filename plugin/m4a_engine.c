@@ -139,12 +139,14 @@ static void chn_vol_set(M4APCMChannel *ch, M4ATrack *track)
     uint32_t panR = (uint32_t)(0x80 + rhythmPan);
     uint32_t volR = panR * velocity;
     uint32_t result = (volR * track->volMR) >> 14;
+    if (track->volumeBoost) result <<= 1;
     if (result > 0xFF) result = 0xFF;
     ch->rightVolume = (uint8_t)result;
 
     uint32_t panL = (uint32_t)(0x7F - rhythmPan);
     uint32_t volL = panL * velocity;
     result = (volL * track->volML) >> 14;
+    if (track->volumeBoost) result <<= 1;
     if (result > 0xFF) result = 0xFF;
     ch->leftVolume = (uint8_t)result;
 }
@@ -156,12 +158,14 @@ static void cgb_chn_vol_set(M4ACGBChannel *ch, M4ATrack *track)
     uint32_t panR = (uint32_t)(0x80 + rhythmPan);
     uint32_t volR = panR * velocity;
     uint32_t result = (volR * track->volMR) >> 14;
+    if (track->volumeBoost) result <<= 1;
     if (result > 0xFF) result = 0xFF;
     ch->rightVolume = (uint8_t)result;
 
     uint32_t panL = (uint32_t)(0x7F - rhythmPan);
     uint32_t volL = panL * velocity;
     result = (volL * track->volML) >> 14;
+    if (track->volumeBoost) result <<= 1;
     if (result > 0xFF) result = 0xFF;
     ch->leftVolume = (uint8_t)result;
 }
@@ -968,6 +972,9 @@ void m4a_engine_cc(M4AEngine *engine, int trackIndex, uint8_t cc, uint8_t value)
                 * Opt-in: ignored unless the PWM feature is enabled.  Mirrors
                 * ply_pwms on the GBA. */
         if (!engine->pwmEnabled)
+            track->volumeBoost = value;
+            m4a_track_vol_pit_set(track);
+            refresh_volumes(engine, track, trackIndex);
             break;
         if (value > 0) {
             /* Only restart the pattern when the effect turns off->on, so the
