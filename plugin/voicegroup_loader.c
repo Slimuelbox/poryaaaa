@@ -2161,6 +2161,28 @@ static int parse_voicegroup_file(const char *projectRoot, const char *filePath,
             }
             voiceIndex++;
             voicesParsedInSection++;
+        } else if (strncmp(trimmed, "voice_directsound_compressed_reverse ", 37) == 0) {
+            int key, pan, attack, decay, sustain, release;
+            char sampleSymbol[MAX_SYMBOL_LEN];
+            if (sscanf(trimmed + 37, "%d, %d, %[^,], %d, %d, %d, %d",
+                       &key, &pan, sampleSymbol, &attack, &decay, &sustain, &release) == 7) {
+                rtrim(sampleSymbol);
+                ToneData *td = &vg->voices[voiceIndex];
+                td->type = VOICE_CRY_REVERSE;
+                td->key = (uint8_t)key;
+                td->panSweep = pan ? (0x80 | pan) : 0;
+                td->attack = (uint8_t)attack;
+                td->decay = (uint8_t)decay;
+                td->sustain = (uint8_t)sustain;
+                td->release = (uint8_t)release;
+
+                WaveData *wd = resolve_and_load_sample(projectRoot, sampleSymbol, dsMap, disc, vg, waveCache);
+                if (wd) {
+                    td->wav = wd;
+                }
+            }
+            voiceIndex++;
+            voicesParsedInSection++;
         } else if (strncmp(trimmed, "voice_directsound_compressed ", 29) == 0) {
             int key, pan, attack, decay, sustain, release;
             char sampleSymbol[MAX_SYMBOL_LEN];
