@@ -37,29 +37,20 @@ void m4a_pcm_channel_start(M4APCMChannel *ch, WaveData *wav, uint8_t type)
     ch->type = type;
     ch->envelopeVolume = 0;
 
-    /* Golden Sun synth voice: a zero-length sample is a synthesized-tone
-     * descriptor, not PCM data.  Matches C_channel_init_synth in the improved
-     * SoundMainRAM mixer. */
-    ch->synthType = M4A_SYNTH_NONE;
-    if (wav->size == 0 && wav->data) {
-        uint8_t waveType = (uint8_t)wav->data[1];
-        if (waveType == 0)
-            ch->synthType = M4A_SYNTH_PULSE;
-        else if (waveType == 1)
-            ch->synthType = M4A_SYNTH_SAW;
-        else
-            ch->synthType = M4A_SYNTH_TRIANGLE;
-        /* The triangle wave starts at 90 degrees phase so the note begins at
-         * the zero crossing instead of the negative peak (avoids a pop).  The
-         * GBA mixer only does this for the exact descriptor value 2. */
-        if (waveType == 2)
-            ch->fw = 0x40000000u;
-        /* Prime the duty threshold so the note doesn't render against a
-         * zero threshold before the first engine tick (on the GBA the frame
-         * that initializes the channel also runs C_setup_synth). */
-        if (ch->synthType == M4A_SYNTH_PULSE)
-            m4a_pcm_synth_pulse_update(ch);
-    }
+    if (wav->size == 0) {
+        /* Synth voice: no sample data, phase accumulator drives the oscillator.
+         * Triangle (type 2) starts at quarter-cycle (0x40000000) to avoid pop. */
+        uint8_t synthType = ((uint8_t *)wav->data)[1];
+        ch->currentPointer = NULL;
+        ch->count = 0;  /* IIR state for saw wave */
+        ch->isLoop = false;
+        ch->loopLen = 0;
+        ch->loopStart = NULL;
+        ch->fw = (synthType == 2) ? 0x40000000 : 0;
+    } else {
+        ch->currentPointer = wav->data;
+        ch->count = wav->size;
+        ch->fw = 0;
 
     /* Check for loop - GBA checks wav->status bits 14-15 (0xC000) */
     ch->isLoop = (wav->status & 0xC000) != 0;
@@ -195,49 +186,57 @@ void m4a_pcm_channel_render(M4APCMChannel *ch, int32_t *mixL, int32_t *mixR)
     if (!(ch->status & CHN_ON) || (ch->status & CHN_START))
         return;
 
-    /* Golden Sun synth voices generate their tone instead of reading sample
-     * data.  fw is the 32-bit oscillator phase (one wave period = 2^32),
-     * advanced by frequency << 3 per output sample -- the pitch of a
-     * 64-sample looped wave at the descriptor's header frequency.  Matches
-     * the C_synth_* loops in the improved SoundMainRAM mixer.
-     *
-     * The "value" amplitudes below are expressed relative to a normal
-     * sample's -128..127 range.  Careful when reading the assembly: the
-     * improved mixer's normal path accumulates samples at DOUBLE scale (its
-     * interpolation computes `base << 1` + `diff * frac >> 22`) against the
-     * halved 0-127 volume, while the synth loops use their raw values with
-     * the unhalved (pulse, triangle) or halved (saw) volume.  Folding that in
-     * gives equivalent amplitudes of +/-64 (pulse), ~+/-112 (saw, after its
-     * filter's DC gain of 2), and +/-128 (triangle) -- confirmed against
-     * agbplay, ipatix's reference player, which mixes these synths at 0.5 /
-     * ~0.875 / 1.0 of full scale respectively. */
-    if (ch->synthType != M4A_SYNTH_NONE) {
-        uint32_t phase = ch->fw;
-        int32_t value;
-        if (ch->synthType == M4A_SYNTH_PULSE) {
-            /* Compared against the duty threshold before the phase advances.
-             * GBA: +/-(vol << 6) at unhalved volume = equivalent +/-64. */
-            value = (phase < ch->synthPulseDuty) ? 64 : -64;
-            phase += ch->frequency << 3;
-        } else if (ch->synthType == M4A_SYNTH_SAW) {
-            /* Pseudo sawtooth: two rising ramps with a jump at mid-period,
-             * smoothed by a one-pole filter (y = x + y/2) kept in count at
-             * full precision.  The GBA mixes the filter state at halved
-             * volume; applied here as a final halving of the value. */
-            phase += ch->frequency << 3;
-            int32_t raw = (int32_t)(phase >> 24) - 0x70
-                        - (int32_t)((phase << 1) >> 27);
-            ch->count = raw + (ch->count >> 1);
-            value = ch->count >> 1;
-        } else {
-            /* Triangle ramping -128..+128 at unhalved volume = equivalent
-             * +/-128, i.e. exactly a full-scale sample. */
-            phase += ch->frequency << 3;
-            if ((int32_t)phase < 0)
-                value = 0x180 - (int32_t)(phase >> 23);
-            else
-                value = (int32_t)(phase >> 23) - 0x80;
+    /* Synth voice: wav->size == 0 means software oscillator, not sample data.
+     * Params: data[1]=type, data[2]=baseDuty, data[3]=widthChange1,
+     *         data[4]=modAmount, data[5]=widthChange2.
+     * Phase accumulator uses the full 32-bit fw; advances by frequency<<3 per
+     * output sample (matches C_setup_synth's r4 = freq*VAR_DEF_PITCH_FAC,
+     * per-sample advance r4<<3). */
+    if (ch->wav->size == 0) {
+        const uint8_t *p = (const uint8_t *)ch->wav->data;
+        uint8_t synthType = p[1];
+        uint32_t phase    = ch->fw;
+        uint32_t step     = ch->frequency << 3;
+        int32_t  sample;
+
+        switch (synthType) {
+        case 0: {  /* Pulse wave (C_synth_pulse_loop) */
+            uint32_t r2   = (uint32_t)p[3] << 24;           /* widthChange1 << 24 */
+            uint32_t r6   = r2 + ((uint32_t)p[5] << 24);   /* + widthChange2 << 24 */
+            if ((int32_t)r6 < 0) r6 = ~r6;                 /* mvnmi */
+            uint32_t duty = (r6 >> 8) * (uint32_t)p[4] + ((uint32_t)p[2] << 24);
+            sample = (phase < duty) ? 64 : -64;
+            phase += step;
+            break;
         }
+        case 1: {  /* Saw wave (C_synth_saw_loop) — leaky integrator approximation.
+                    * ch->count holds the IIR state (r2 in assembly). Volume is
+                    * halved in the GBA (r11 lsr#1), reproduced here via >>9. */
+            phase += step;
+            int32_t r9    = (int32_t)(phase >> 24) - 0x70 - (int32_t)(phase >> 26);
+            int32_t state = (int32_t)ch->count;
+            state = r9 + (state >> 1);
+            ch->count = state;
+            sample = state;
+            *mixR += (sample * ch->envelopeVolumeRight) >> 9;
+            *mixL += (sample * ch->envelopeVolumeLeft)  >> 9;
+            ch->fw = phase;
+            return;
+        }
+        case 2: {  /* Triangle wave (C_synth_triangle_loop) */
+            phase += step;
+            if ((phase & 0x80000000) == 0)
+                sample = (int32_t)(phase >> 23) - 128;      /* ascending: -128..127 */
+            else
+                sample = 384 - (int32_t)(phase >> 23);      /* descending: 128..-127 */
+            break;
+        }
+        default:
+            sample = 0;
+            phase += step;
+            break;
+        }
+
         ch->fw = phase;
         *mixR += (value * ch->envelopeVolumeRight) >> 8;
         *mixL += (value * ch->envelopeVolumeLeft) >> 8;

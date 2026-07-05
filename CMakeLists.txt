@@ -214,7 +214,7 @@ if(UNIX AND NOT APPLE)
 elseif(APPLE)
     target_link_libraries(poryaaaa-standalone PRIVATE "-framework OpenGL" "-framework Cocoa" "-framework CoreVideo")
 elseif(WIN32)
-    target_link_libraries(poryaaaa-standalone PRIVATE opengl32 dwmapi -Wl,-Bstatic -lpthread -Wl,-Bdynamic -static-libgcc -static-libstdc++)
+    target_link_libraries(poryaaaa-standalone PRIVATE opengl32 dwmapi -static-libgcc -static-libstdc++)
 endif()
 
 target_add_standalone_wrapper(

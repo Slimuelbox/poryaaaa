@@ -1228,13 +1228,7 @@ static WaveData *load_wave_data(const char *projectRoot, const char *relativePat
     uint32_t loopStart = header[8] | (header[9] << 8) | (header[10] << 16) | (header[11] << 24);
     uint32_t size = header[12] | (header[13] << 8) | (header[14] << 16) | (header[15] << 24);
 
-    /* A zero-length sample is a Golden Sun synth-instrument descriptor
-     * (ipatix improved-mixer feature): the bytes after the header select the
-     * waveform and pulse parameters instead of holding PCM data.  Keep up to
-     * 16 descriptor bytes so the engine can read them. */
-    uint32_t dataSize = (size > 0) ? size : 16;
-
-    WaveData *wd = malloc(sizeof(WaveData) + dataSize + 1);
+    WaveData *wd = malloc(sizeof(WaveData) + size + 1);
     if (!wd) {
         fclose(f);
         return NULL;
@@ -1249,11 +1243,11 @@ static WaveData *load_wave_data(const char *projectRoot, const char *relativePat
     wd->size = size;
     wd->data = (int8_t *)((uint8_t *)wd + sizeof(WaveData));
 
-    size_t bytesRead = fread(wd->data, 1, dataSize, f);
-    if (bytesRead < dataSize) {
-        memset(wd->data + bytesRead, 0, dataSize - bytesRead);
+    size_t bytesRead = fread(wd->data, 1, size, f);
+    if (bytesRead < size) {
+        memset(wd->data + bytesRead, 0, size - bytesRead);
     }
-    wd->data[dataSize] = wd->data[dataSize - 1];
+    wd->data[size] = wd->data[size > 0 ? size - 1 : 0];
 
     fclose(f);
     return wd;
