@@ -698,6 +698,9 @@ static void discover_project(const char *projectRoot,
         snprintf(subPath, sizeof(subPath), "%s%cdrumsets", path, PATH_SEP);
         if (is_directory(subPath))
             pathlist_add(&out->voicegroupDirs, subPath);
+        snprintf(subPath, sizeof(subPath), "%s%csamplechops", path, PATH_SEP);
+        if (is_directory(subPath))
+            pathlist_add(&out->voicegroupDirs, subPath);
     }
 
     /* 4. Scan under sound/ for voicegroup dirs AND wav dirs in one pass */
@@ -1546,6 +1549,52 @@ static VoicegroupLocation find_voicegroup(const char *projectRoot,
                 }
             }
         }
+        
+    }
+    {
+        const char *suffix = strstr(vgName, "_samplechop");
+        if (suffix) {
+            char baseName[MAX_SYMBOL_LEN];
+            int baseLen = (int)(suffix - vgName);
+            if (baseLen > 0 && baseLen < MAX_SYMBOL_LEN) {
+                memcpy(baseName, vgName, baseLen);
+                baseName[baseLen] = '\0';
+                /* Explicit <dir>/samplechops/<base>.inc probe for each voicegroup dir */
+                for (int i = 0; i < disc->voicegroupDirs.count; i++) {
+                    snprintf(path, sizeof(path), "%s%csamplechops%c%s.inc",
+                             disc->voicegroupDirs.paths[i], PATH_SEP, PATH_SEP, baseName);
+                    if (file_exists(path)) {
+                        strncpy(loc.filePath, path, MAX_PATH_LEN - 1);
+                        loc.found = 1;
+                        return loc;
+                    }
+                    snprintf(path, sizeof(path), "%s%csamplechops%c%s.s",
+                             disc->voicegroupDirs.paths[i], PATH_SEP, PATH_SEP, baseName);
+                    if (file_exists(path)) {
+                        strncpy(loc.filePath, path, MAX_PATH_LEN - 1);
+                        loc.found = 1;
+                        return loc;
+                    }
+                }
+                /* Also check dirs that are themselves named "samplechops" */
+                for (int i = 0; i < disc->voicegroupDirs.count; i++) {
+                    if (!dir_last_component_is(disc->voicegroupDirs.paths[i], "samplechops"))
+                        continue;
+                    snprintf(path, sizeof(path), "%s%c%s.inc", disc->voicegroupDirs.paths[i], PATH_SEP, baseName);
+                    if (file_exists(path)) {
+                        strncpy(loc.filePath, path, MAX_PATH_LEN - 1);
+                        loc.found = 1;
+                        return loc;
+                    }
+                    snprintf(path, sizeof(path), "%s%c%s.s", disc->voicegroupDirs.paths[i], PATH_SEP, baseName);
+                    if (file_exists(path)) {
+                        strncpy(loc.filePath, path, MAX_PATH_LEN - 1);
+                        loc.found = 1;
+                        return loc;
+                    }
+                }
+            }
+        }
     }
     {
         const char *suffix = strstr(vgName, "_drumset");
@@ -2108,6 +2157,28 @@ static int parse_voicegroup_file(const char *projectRoot, const char *filePath,
                         td->wav = wd;
                         vg_register_wavedata(vg, wd);
                     }
+                }
+            }
+            voiceIndex++;
+            voicesParsedInSection++;
+        } else if (strncmp(trimmed, "voice_directsound_compressed ", 29) == 0) {
+            int key, pan, attack, decay, sustain, release;
+            char sampleSymbol[MAX_SYMBOL_LEN];
+            if (sscanf(trimmed + 29, "%d, %d, %[^,], %d, %d, %d, %d",
+                       &key, &pan, sampleSymbol, &attack, &decay, &sustain, &release) == 7) {
+                rtrim(sampleSymbol);
+                ToneData *td = &vg->voices[voiceIndex];
+                td->type = VOICE_CRY;
+                td->key = (uint8_t)key;
+                td->panSweep = pan ? (0x80 | pan) : 0;
+                td->attack = (uint8_t)attack;
+                td->decay = (uint8_t)decay;
+                td->sustain = (uint8_t)sustain;
+                td->release = (uint8_t)release;
+
+                WaveData *wd = resolve_and_load_sample(projectRoot, sampleSymbol, dsMap, disc, vg, waveCache);
+                if (wd) {
+                    td->wav = wd;
                 }
             }
             voiceIndex++;
